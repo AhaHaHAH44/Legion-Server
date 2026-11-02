@@ -143,16 +143,20 @@ function getRouletteJackpot(reels) {
 }
 
 function getRouletteMatchForPlayer(playerId) {
-    for (const match of rouletteMatches.values()) {
-        if (
-            ['waiting', 'finished'].includes(match.status) &&
+    const matches = [...rouletteMatches.values()]
+        .filter(match =>
             match.players.some(player => player.id === playerId)
-        ) {
-            return match;
-        }
-    }
+        )
+        .sort((a, b) => b.createdAt - a.createdAt);
 
-    return null;
+    return matches[0] || null;
+}
+
+function getActiveRouletteMatchForPlayer(playerId) {
+    return [...rouletteMatches.values()].find(match =>
+        match.status === 'waiting' &&
+        match.players.some(player => player.id === playerId)
+    ) || null;
 }
 
 function getWinner(move1, move2) {
@@ -819,8 +823,8 @@ app.post('/api/roulette/invites/:inviteId/respond', (req, res) => {
     }
 
     if (
-        getRouletteMatchForPlayer(first.id) ||
-        getRouletteMatchForPlayer(second.id)
+        getActiveRouletteMatchForPlayer(first.id) ||
+        getActiveRouletteMatchForPlayer(second.id)
     ) {
         return res.status(409).json({
             error: 'A player is already in a roulette round'
