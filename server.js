@@ -96,7 +96,7 @@ app.get('/health', (req, res) => {
 // ========================================
 
 app.post('/api/players/heartbeat', (req, res) => {
-    const { id, nickname } = req.body || {};
+    const { id, nickname, doNotDisturb } = req.body || {};
 
     if (
         typeof id !== 'string' ||
@@ -111,15 +111,28 @@ app.post('/api/players/heartbeat', (req, res) => {
         });
     }
 
+    if (
+        doNotDisturb !== undefined &&
+        typeof doNotDisturb !== 'boolean'
+    ) {
+        return res.status(400).json({
+            error: 'Invalid doNotDisturb value'
+        });
+    }
+
     cleanup();
 
     const cleanNickname = nickname.trim();
-    const isNew = !players.has(id);
+    const existingPlayer = players.get(id);
+    const isNew = !existingPlayer;
 
     players.set(id, {
         id,
         nickname: cleanNickname,
-        lastSeen: Date.now()
+        lastSeen: Date.now(),
+        doNotDisturb: doNotDisturb !== undefined
+            ? doNotDisturb
+            : (existingPlayer?.doNotDisturb ?? false)
     });
 
     if (isNew) {
@@ -128,7 +141,42 @@ app.post('/api/players/heartbeat', (req, res) => {
 
     res.json({
         success: true,
-        playerId: id
+        playerId: id,
+        doNotDisturb: players.get(id).doNotDisturb
+    });
+});
+
+// ========================================
+// DO NOT DISTURB
+// ========================================
+
+app.post('/api/players/:playerId/do-not-disturb', (req, res) => {
+    const playerId = req.params.playerId;
+    const { enabled } = req.body || {};
+
+    if (typeof enabled !== 'boolean') {
+        return res.status(400).json({
+            error: 'Invalid doNotDisturb value'
+        });
+    }
+
+    const player = players.get(playerId);
+
+    if (!player) {
+        return res.status(404).json({
+            error: 'Player not found'
+        });
+    }
+
+    player.doNotDisturb = enabled;
+
+    console.log(
+        `Do Not Disturb ${enabled ? 'enabled' : 'disabled'}: ${player.nickname}`
+    );
+
+    res.json({
+        success: true,
+        doNotDisturb: player.doNotDisturb
     });
 });
 
@@ -141,7 +189,8 @@ app.get('/api/players', (req, res) => {
 
     const onlinePlayers = Array.from(players.values()).map(player => ({
         id: player.id,
-        nickname: player.nickname
+        nickname: player.nickname,
+        doNotDisturb: player.doNotDisturb ?? false
     }));
 
     res.json({
@@ -179,12 +228,21 @@ app.post('/api/invites', (req, res) => {
         });
     }
 
+    // Проверяем режим «Не беспокоить»
+    if (recipient.doNotDisturb) {
+        return res.status(403).json({
+            error: 'Player does not accept invitations'
+        });
+    }
+
+    // Проверяем, участвуют ли игроки в активном матче
     if (getMatchForPlayer(fromId) || getMatchForPlayer(toId)) {
         return res.status(409).json({
             error: 'A player is already in a match'
         });
     }
 
+    // Проверяем повторное приглашение
     const existing = Array.from(invitations.values()).find(invite =>
         invite.fromId === fromId &&
         invite.toId === toId
