@@ -1,18 +1,20 @@
+
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
 
-const io = new Server(server, {
-    cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
-    }
-});
+app.use(express.json());
 
-// Проверка работоспособности сервера
+const players = new Map();
+
+const PLAYER_TIMEOUT = 60000;
+
+// ========================================
+// HEALTH CHECK
+// ========================================
+
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
@@ -21,25 +23,82 @@ app.get('/', (req, res) => {
     });
 });
 
-// Проверка состояния сервера
 app.get('/health', (req, res) => {
     res.json({ status: 'ok' });
 });
 
-// Подключение игроков
-io.on('connection', (socket) => {
-    console.log(`Player connected: ${socket.id}`);
+// ========================================
+// PLAYER REGISTRATION
+// ========================================
 
-    socket.emit('server:ready', {
-        message: 'Connected to Legion Server'
+app.post('/api/players/heartbeat', (req, res) => {
+    const { id, nickname } = req.body || {};
+
+    if (
+        typeof id !== 'string' ||
+        id.length < 10 ||
+        id.length > 100 ||
+        typeof nickname !== 'string' ||
+        nickname.trim().length === 0 ||
+        nickname.length > 32
+    ) {
+        return res.status(400).json({
+            error: 'Invalid player data'
+        });
+    }
+
+    const cleanNickname = nickname.trim();
+
+    const isNewPlayer = !players.has(id);
+
+    players.set(id, {
+        id,
+        nickname: cleanNickname,
+        lastSeen: Date.now()
     });
 
-    socket.on('disconnect', () => {
-        console.log(`Player disconnected: ${socket.id}`);
+    if (isNewPlayer) {
+        console.log(`Player joined: ${cleanNickname} (${id})`);
+    }
+
+    res.json({
+        success: true,
+        message: 'Player registered',
+        playerId: id
     });
 });
 
-// Запуск сервера
+// ========================================
+// ONLINE PLAYERS
+// ========================================
+
+app.get('/api/players', (req, res) => {
+    const now = Date.now();
+
+    // Remove inactive players
+    for (const [id, player] of players.entries()) {
+        if (now - player.lastSeen > PLAYER_TIMEOUT) {
+            console.log(`Player left: ${player.nickname}`);
+            players.delete(id);
+        }
+    }
+
+    const onlinePlayers = Array.from(players.values()).map(player => ({
+        id: player.id,
+        nickname: player.nickname
+    }));
+
+    res.json({
+        success: true,
+        count: onlinePlayers.length,
+        players: onlinePlayers
+    });
+});
+
+// ========================================
+// SERVER START
+// ========================================
+
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
