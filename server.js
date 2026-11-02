@@ -54,8 +54,8 @@ function cleanup() {
 function getMatchForPlayer(playerId) {
     for (const match of matches.values()) {
         if (
-            match.players.some(player => player.id === playerId) &&
-            match.status !== 'expired'
+            match.status === 'playing' &&
+            match.players.some(player => player.id === playerId)
         ) {
             return match;
         }
