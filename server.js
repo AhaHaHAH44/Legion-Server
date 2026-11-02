@@ -9,33 +9,75 @@ app.use(express.json({ limit: '10kb' }));
 
 const players = new Map();
 const invitations = new Map();
+const matches = new Map();
 
 const PLAYER_TIMEOUT = 60000;
 const INVITE_TIMEOUT = 30000;
+const MATCH_TIMEOUT = 300000;
 
 // ========================================
-// CLEANUP
+// HELPERS
 // ========================================
 
 function cleanup() {
     const now = Date.now();
 
-    for (const [id, player] of players.entries()) {
+    for (const [id, player] of players) {
         if (now - player.lastSeen > PLAYER_TIMEOUT) {
             console.log(`Player left: ${player.nickname}`);
             players.delete(id);
         }
     }
 
-    for (const [id, invite] of invitations.entries()) {
+    for (const [id, invite] of invitations) {
         if (now > invite.expiresAt) {
             invitations.delete(id);
         }
     }
+
+    for (const [id, match] of matches) {
+        if (
+            match.status === 'finished' &&
+            now - match.finishedAt > 120000
+        ) {
+            matches.delete(id);
+        } else if (
+            match.status === 'playing' &&
+            now - match.createdAt > MATCH_TIMEOUT
+        ) {
+            match.status = 'expired';
+            match.finishedAt = now;
+        }
+    }
+}
+
+function getMatchForPlayer(playerId) {
+    for (const match of matches.values()) {
+        if (
+            match.players.some(player => player.id === playerId) &&
+            match.status !== 'expired'
+        ) {
+            return match;
+        }
+    }
+
+    return null;
+}
+
+function getWinner(move1, move2) {
+    if (move1 === move2) return 'draw';
+
+    const wins = {
+        rock: 'scissors',
+        scissors: 'paper',
+        paper: 'rock'
+    };
+
+    return wins[move1] === move2 ? 'first' : 'second';
 }
 
 // ========================================
-// HEALTH CHECK
+// HEALTH
 // ========================================
 
 app.get('/', (req, res) => {
@@ -72,7 +114,7 @@ app.post('/api/players/heartbeat', (req, res) => {
     cleanup();
 
     const cleanNickname = nickname.trim();
-    const isNewPlayer = !players.has(id);
+    const isNew = !players.has(id);
 
     players.set(id, {
         id,
@@ -80,7 +122,7 @@ app.post('/api/players/heartbeat', (req, res) => {
         lastSeen: Date.now()
     });
 
-    if (isNewPlayer) {
+    if (isNew) {
         console.log(`Player joined: ${cleanNickname} (${id})`);
     }
 
@@ -110,7 +152,7 @@ app.get('/api/players', (req, res) => {
 });
 
 // ========================================
-// SEND INVITATION
+// INVITATIONS
 // ========================================
 
 app.post('/api/invites', (req, res) => {
@@ -137,6 +179,12 @@ app.post('/api/invites', (req, res) => {
         });
     }
 
+    if (getMatchForPlayer(fromId) || getMatchForPlayer(toId)) {
+        return res.status(409).json({
+            error: 'A player is already in a match'
+        });
+    }
+
     const existing = Array.from(invitations.values()).find(invite =>
         invite.fromId === fromId &&
         invite.toId === toId
@@ -154,8 +202,6 @@ app.post('/api/invites', (req, res) => {
         fromNickname: sender.nickname,
         toId,
         toNickname: recipient.nickname,
-        status: 'pending',
-        createdAt: Date.now(),
         expiresAt: Date.now() + INVITE_TIMEOUT
     };
 
@@ -172,7 +218,7 @@ app.post('/api/invites', (req, res) => {
 });
 
 // ========================================
-// GET PLAYER INVITATIONS
+// GET INVITATIONS
 // ========================================
 
 app.get('/api/invites/:playerId', (req, res) => {
@@ -187,15 +233,11 @@ app.get('/api/invites/:playerId', (req, res) => {
     }
 
     const incoming = Array.from(invitations.values())
-        .filter(invite =>
-            invite.toId === playerId &&
-            invite.status === 'pending'
-        )
+        .filter(invite => invite.toId === playerId)
         .map(invite => ({
             id: invite.id,
             fromId: invite.fromId,
             fromNickname: invite.fromNickname,
-            createdAt: invite.createdAt,
             expiresAt: invite.expiresAt
         }));
 
@@ -206,7 +248,7 @@ app.get('/api/invites/:playerId', (req, res) => {
 });
 
 // ========================================
-// ACCEPT OR REJECT INVITATION
+// RESPOND TO INVITATION
 // ========================================
 
 app.post('/api/invites/:inviteId/respond', (req, res) => {
@@ -217,7 +259,7 @@ app.post('/api/invites/:inviteId/respond', (req, res) => {
 
     if (!invite) {
         return res.status(404).json({
-            error: 'Invitation not found or expired'
+            error: 'Invitation expired or not found'
         });
     }
 
@@ -241,19 +283,199 @@ app.post('/api/invites/:inviteId/respond', (req, res) => {
         });
     }
 
-    invite.status = accept ? 'accepted' : 'rejected';
-
     invitations.delete(invite.id);
 
+    if (!accept) {
+        console.log(`Invitation rejected: ${invite.toNickname}`);
+
+        return res.json({
+            success: true,
+            status: 'rejected'
+        });
+    }
+
+    if (
+        getMatchForPlayer(invite.fromId) ||
+        getMatchForPlayer(invite.toId)
+    ) {
+        return res.status(409).json({
+            error: 'A player is already in a match'
+        });
+    }
+
+    const first = players.get(invite.fromId);
+    const second = players.get(invite.toId);
+
+    const match = {
+        id: crypto.randomUUID(),
+        game: 'rock-paper-scissors',
+        status: 'playing',
+        createdAt: Date.now(),
+        players: [
+            {
+                id: first.id,
+                nickname: first.nickname,
+                move: null
+            },
+            {
+                id: second.id,
+                nickname: second.nickname,
+                move: null
+            }
+        ],
+        winner: null,
+        finishedAt: null
+    };
+
+    matches.set(match.id, match);
+
     console.log(
-        `Invitation ${invite.status}: ${invite.fromNickname} -> ${invite.toNickname}`
+        `Match created: ${first.nickname} vs ${second.nickname}`
     );
 
     res.json({
         success: true,
-        status: invite.status,
-        fromId: invite.fromId,
-        fromNickname: invite.fromNickname
+        status: 'accepted',
+        matchId: match.id
+    });
+});
+
+// ========================================
+// GET PLAYER MATCH
+// ========================================
+
+app.get('/api/matches/player/:playerId', (req, res) => {
+    cleanup();
+
+    const playerId = req.params.playerId;
+    const match = getMatchForPlayer(playerId);
+
+    if (!match) {
+        return res.json({
+            success: true,
+            match: null
+        });
+    }
+
+    res.json({
+        success: true,
+        match: {
+            id: match.id,
+            game: match.game,
+            status: match.status,
+            players: match.players.map(player => ({
+                id: player.id,
+                nickname: player.nickname,
+                hasMoved: player.move !== null
+            })),
+            winner: match.winner
+        }
+    });
+});
+
+// ========================================
+// SUBMIT MOVE
+// ========================================
+
+app.post('/api/matches/:matchId/move', (req, res) => {
+    cleanup();
+
+    const { playerId, move } = req.body || {};
+    const match = matches.get(req.params.matchId);
+
+    if (!match || match.status !== 'playing') {
+        return res.status(404).json({
+            error: 'Match not found or finished'
+        });
+    }
+
+    if (!['rock', 'paper', 'scissors'].includes(move)) {
+        return res.status(400).json({
+            error: 'Invalid move'
+        });
+    }
+
+    const player = match.players.find(p => p.id === playerId);
+
+    if (!player) {
+        return res.status(403).json({
+            error: 'You are not a participant'
+        });
+    }
+
+    if (player.move !== null) {
+        return res.status(409).json({
+            error: 'You have already moved'
+        });
+    }
+
+    player.move = move;
+
+    console.log(`Move submitted in match ${match.id}`);
+
+    const bothMoved = match.players.every(p => p.move !== null);
+
+    if (bothMoved) {
+        const result = getWinner(
+            match.players[0].move,
+            match.players[1].move
+        );
+
+        match.winner = result === 'draw'
+            ? 'draw'
+            : match.players[result === 'first' ? 0 : 1].id;
+
+        match.status = 'finished';
+        match.finishedAt = Date.now();
+
+        console.log(`Match finished: ${match.winner}`);
+    }
+
+    res.json({
+        success: true,
+        waitingForOpponent: !bothMoved
+    });
+});
+
+// ========================================
+// GET MATCH RESULT
+// ========================================
+
+app.get('/api/matches/:matchId', (req, res) => {
+    cleanup();
+
+    const { playerId } = req.query;
+    const match = matches.get(req.params.matchId);
+
+    if (!match) {
+        return res.status(404).json({
+            error: 'Match not found'
+        });
+    }
+
+    const currentPlayer = match.players.find(p => p.id === playerId);
+
+    if (!currentPlayer) {
+        return res.status(403).json({
+            error: 'You are not a participant'
+        });
+    }
+
+    const bothMoved = match.players.every(p => p.move !== null);
+
+    res.json({
+        success: true,
+        match: {
+            id: match.id,
+            status: match.status,
+            players: match.players.map(player => ({
+                id: player.id,
+                nickname: player.nickname,
+                move: bothMoved ? player.move : null,
+                hasMoved: player.move !== null
+            })),
+            winner: bothMoved ? match.winner : null
+        }
     });
 });
 
