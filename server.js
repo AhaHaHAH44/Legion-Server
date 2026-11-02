@@ -11,6 +11,24 @@ const players = new Map();
 const invitations = new Map();
 const matches = new Map();
 
+// Кото-рулетка: временные данные хранятся в памяти сервера.
+const rouletteCooldowns = new Map();
+const rouletteInvitations = new Map();
+const rouletteMatches = new Map();
+
+const ROULETTE_COOLDOWN = 5 * 60 * 1000;
+const ROULETTE_INVITE_TIMEOUT = 30000;
+const ROULETTE_MATCH_TIMEOUT = 180000;
+
+const ROULETTE_RESOURCES = [
+    { id: 'pebble', name: 'Камушек', emoji: '🪨', points: 1, weight: 32 },
+    { id: 'limestone', name: 'Известняк', emoji: '⚪', points: 2, weight: 26 },
+    { id: 'iron', name: 'Железо', emoji: '⛓️', points: 3, weight: 15 },
+    { id: 'coal', name: 'Уголь', emoji: '⬛', points: 3, weight: 15 },
+    { id: 'gold', name: 'Золото', emoji: '🟡', points: 5, weight: 10 },
+    { id: 'topaz', name: 'Топаз', emoji: '💎', points: 8, weight: 2 }
+];
+
 const PLAYER_TIMEOUT = 60000;
 const INVITE_TIMEOUT = 30000;
 const MATCH_TIMEOUT = 300000;
@@ -26,6 +44,25 @@ function cleanup() {
         if (now - player.lastSeen > PLAYER_TIMEOUT) {
             console.log(`Player left: ${player.nickname}`);
             players.delete(id);
+        }
+    }
+
+    for (const [id, invite] of rouletteInvitations) {
+        if (now > invite.expiresAt) rouletteInvitations.delete(id);
+    }
+
+    for (const [id, match] of rouletteMatches) {
+        if (
+            match.status === 'finished' &&
+            now - match.finishedAt > 120000
+        ) {
+            rouletteMatches.delete(id);
+        } else if (
+            match.status !== 'finished' &&
+            now - match.createdAt > ROULETTE_MATCH_TIMEOUT
+        ) {
+            match.status = 'expired';
+            match.finishedAt = now;
         }
     }
 
@@ -55,6 +92,60 @@ function getMatchForPlayer(playerId) {
     for (const match of matches.values()) {
         if (
             match.status === 'playing' &&
+            match.players.some(player => player.id === playerId)
+        ) {
+            return match;
+        }
+    }
+
+    return null;
+}
+
+function getRouletteResource() {
+    const total = ROULETTE_RESOURCES.reduce(
+        (sum, item) => sum + item.weight,
+        0
+    );
+
+    let roll = crypto.randomInt(total);
+
+    for (const resource of ROULETTE_RESOURCES) {
+        roll -= resource.weight;
+
+        if (roll < 0) {
+            return {
+                id: resource.id,
+                name: resource.name,
+                emoji: resource.emoji,
+                points: resource.points
+            };
+        }
+    }
+
+    return { ...ROULETTE_RESOURCES[0] };
+}
+
+function spinRoulette() {
+    return [
+        getRouletteResource(),
+        getRouletteResource(),
+        getRouletteResource()
+    ];
+}
+
+function getRouletteScore(reels) {
+    return reels.reduce((sum, item) => sum + item.points, 0);
+}
+
+function getRouletteJackpot(reels) {
+    return reels.length === 3 &&
+        reels.every(item => item.id === reels[0].id);
+}
+
+function getRouletteMatchForPlayer(playerId) {
+    for (const match of rouletteMatches.values()) {
+        if (
+            ['waiting', 'finished'].includes(match.status) &&
             match.players.some(player => player.id === playerId)
         ) {
             return match;
@@ -228,21 +319,18 @@ app.post('/api/invites', (req, res) => {
         });
     }
 
-    // Проверяем режим «Не беспокоить»
     if (recipient.doNotDisturb) {
         return res.status(403).json({
             error: 'Player does not accept invitations'
         });
     }
 
-    // Проверяем, участвуют ли игроки в активном матче
     if (getMatchForPlayer(fromId) || getMatchForPlayer(toId)) {
         return res.status(409).json({
             error: 'A player is already in a match'
         });
     }
 
-    // Проверяем повторное приглашение
     const existing = Array.from(invitations.values()).find(invite =>
         invite.fromId === fromId &&
         invite.toId === toId
@@ -534,6 +622,324 @@ app.get('/api/matches/:matchId', (req, res) => {
             })),
             winner: bothMoved ? match.winner : null
         }
+    });
+});
+
+// ========================================
+// КОТО-РУЛЕТКА
+// ========================================
+
+// Состояние одиночной шахты и время следующей попытки
+app.get('/api/roulette/status/:playerId', (req, res) => {
+    const playerId = req.params.playerId;
+    const nextAt = rouletteCooldowns.get(playerId) || 0;
+
+    res.json({
+        success: true,
+        cooldownMs: Math.max(0, nextAt - Date.now()),
+        nextAt
+    });
+});
+
+// Одиночная прокрутка: результат и кулдаун рассчитываются сервером
+app.post('/api/roulette/solo', (req, res) => {
+    cleanup();
+
+    const { playerId } = req.body || {};
+
+    if (typeof playerId !== 'string' || !players.has(playerId)) {
+        return res.status(404).json({
+            error: 'Player not found or offline'
+        });
+    }
+
+    const now = Date.now();
+    const nextAt = rouletteCooldowns.get(playerId) || 0;
+
+    if (now < nextAt) {
+        return res.status(429).json({
+            error: 'Попытка ещё восстанавливается',
+            cooldownMs: nextAt - now,
+            nextAt
+        });
+    }
+
+    const reels = spinRoulette();
+    const jackpot = getRouletteJackpot(reels);
+
+    rouletteCooldowns.set(playerId, now + ROULETTE_COOLDOWN);
+
+    res.json({
+        success: true,
+        mode: 'solo',
+        reels,
+        score: getRouletteScore(reels),
+        jackpot,
+        nextAt: now + ROULETTE_COOLDOWN,
+        cooldownMs: ROULETTE_COOLDOWN
+    });
+});
+
+// Создать приглашение в совместную шахту
+app.post('/api/roulette/invites', (req, res) => {
+    cleanup();
+
+    const { fromId, toId } = req.body || {};
+
+    if (
+        typeof fromId !== 'string' ||
+        typeof toId !== 'string' ||
+        fromId === toId
+    ) {
+        return res.status(400).json({
+            error: 'Invalid invitation'
+        });
+    }
+
+    const sender = players.get(fromId);
+    const recipient = players.get(toId);
+
+    if (!sender || !recipient) {
+        return res.status(404).json({
+            error: 'Player not found or offline'
+        });
+    }
+
+    if (recipient.doNotDisturb) {
+        return res.status(403).json({
+            error: 'Player does not accept invitations'
+        });
+    }
+
+    if (
+        getRouletteMatchForPlayer(fromId) ||
+        getRouletteMatchForPlayer(toId)
+    ) {
+        return res.status(409).json({
+            error: 'A player is already in a roulette round'
+        });
+    }
+
+    const alreadyInvited = Array.from(rouletteInvitations.values()).some(invite =>
+        invite.fromId === fromId &&
+        invite.toId === toId
+    );
+
+    if (alreadyInvited) {
+        return res.status(409).json({
+            error: 'Invitation already sent'
+        });
+    }
+
+    const invite = {
+        id: crypto.randomUUID(),
+        fromId,
+        fromNickname: sender.nickname,
+        toId,
+        toNickname: recipient.nickname,
+        expiresAt: Date.now() + ROULETTE_INVITE_TIMEOUT
+    };
+
+    rouletteInvitations.set(invite.id, invite);
+
+    res.json({
+        success: true,
+        invitationId: invite.id
+    });
+});
+
+// Получить входящие приглашения в рулетку
+app.get('/api/roulette/invites/:playerId', (req, res) => {
+    cleanup();
+
+    const playerId = req.params.playerId;
+
+    if (!players.has(playerId)) {
+        return res.status(404).json({
+            error: 'Player not found'
+        });
+    }
+
+    const incoming = Array.from(rouletteInvitations.values())
+        .filter(invite => invite.toId === playerId)
+        .map(invite => ({
+            id: invite.id,
+            fromId: invite.fromId,
+            fromNickname: invite.fromNickname,
+            expiresAt: invite.expiresAt
+        }));
+
+    res.json({
+        success: true,
+        invitations: incoming
+    });
+});
+
+// Принять или отклонить приглашение
+app.post('/api/roulette/invites/:inviteId/respond', (req, res) => {
+    cleanup();
+
+    const { playerId, accept } = req.body || {};
+    const invite = rouletteInvitations.get(req.params.inviteId);
+
+    if (!invite) {
+        return res.status(404).json({
+            error: 'Invitation expired or not found'
+        });
+    }
+
+    if (invite.toId !== playerId) {
+        return res.status(403).json({
+            error: 'This invitation belongs to another player'
+        });
+    }
+
+    if (typeof accept !== 'boolean') {
+        return res.status(400).json({
+            error: 'Invalid response'
+        });
+    }
+
+    rouletteInvitations.delete(invite.id);
+
+    if (!accept) {
+        return res.json({
+            success: true,
+            status: 'rejected'
+        });
+    }
+
+    const first = players.get(invite.fromId);
+    const second = players.get(invite.toId);
+
+    if (!first || !second) {
+        return res.status(409).json({
+            error: 'A player is offline'
+        });
+    }
+
+    if (
+        getRouletteMatchForPlayer(first.id) ||
+        getRouletteMatchForPlayer(second.id)
+    ) {
+        return res.status(409).json({
+            error: 'A player is already in a roulette round'
+        });
+    }
+
+    const match = {
+        id: crypto.randomUUID(),
+        game: 'koto-roulette',
+        status: 'waiting',
+        createdAt: Date.now(),
+        finishedAt: null,
+        winner: null,
+        players: [
+            {
+                id: first.id,
+                nickname: first.nickname,
+                reels: null,
+                score: null
+            },
+            {
+                id: second.id,
+                nickname: second.nickname,
+                reels: null,
+                score: null
+            }
+        ]
+    };
+
+    rouletteMatches.set(match.id, match);
+
+    res.json({
+        success: true,
+        status: 'accepted',
+        matchId: match.id
+    });
+});
+
+// Получить активную совместную игру
+app.get('/api/roulette/matches/player/:playerId', (req, res) => {
+    cleanup();
+
+    const match = getRouletteMatchForPlayer(req.params.playerId);
+
+    if (!match) {
+        return res.json({
+            success: true,
+            match: null
+        });
+    }
+
+    res.json({
+        success: true,
+        match: {
+            id: match.id,
+            status: match.status,
+            players: match.players.map(player => ({
+                id: player.id,
+                nickname: player.nickname,
+                hasSpun: !!player.reels,
+                reels: player.reels,
+                score: player.score
+            })),
+            winner: match.winner
+        }
+    });
+});
+
+// Каждый участник делает одну прокрутку.
+// Оба сохраняют свои результаты.
+app.post('/api/roulette/matches/:matchId/spin', (req, res) => {
+    cleanup();
+
+    const { playerId } = req.body || {};
+    const match = rouletteMatches.get(req.params.matchId);
+
+    if (!match || !['waiting', 'finished'].includes(match.status)) {
+        return res.status(404).json({
+            error: 'Roulette match not found'
+        });
+    }
+
+    const player = match.players.find(item => item.id === playerId);
+
+    if (!player) {
+        return res.status(403).json({
+            error: 'You are not a participant'
+        });
+    }
+
+    if (player.reels) {
+        return res.status(409).json({
+            error: 'You have already spun'
+        });
+    }
+
+    player.reels = spinRoulette();
+    player.score = getRouletteScore(player.reels);
+
+    const bothSpun = match.players.every(item => item.reels);
+
+    if (bothSpun) {
+        const firstScore = match.players[0].score;
+        const secondScore = match.players[1].score;
+
+        match.winner = firstScore === secondScore
+            ? 'draw'
+            : match.players[firstScore > secondScore ? 0 : 1].id;
+
+        match.status = 'finished';
+        match.finishedAt = Date.now();
+    }
+
+    res.json({
+        success: true,
+        reels: player.reels,
+        score: player.score,
+        jackpot: getRouletteJackpot(player.reels),
+        waitingForOpponent: !bothSpun
     });
 });
 
