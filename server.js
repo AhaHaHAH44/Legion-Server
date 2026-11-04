@@ -739,6 +739,7 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
             COALESCE(t.total_earned, 0) AS total_earned,
             COALESCE(s.jackpots, 0) AS jackpots,
             COALESCE(s.personal_max_jackpot, 0) AS personal_max_jackpot
+            COALESCE(s.total_spins, 0) AS total_spins
         
             FROM roulette_accounts a
             
@@ -782,6 +783,8 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
                         0
                     ) AS personal_max_jackpot
             
+                    COUNT(*) AS total_spins
+
                 FROM roulette_spins
                 GROUP BY player_id
             ) s ON s.player_id = a.player_id
@@ -800,6 +803,7 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
             COALESCE(t.total_earned, 0) AS total_earned,
             COALESCE(s.jackpots, 0) AS jackpots,
             COALESCE(s.personal_max_jackpot, 0) AS personal_max_jackpot
+            COALESCE(s.total_spins, 0) AS total_spins
         
             FROM roulette_accounts a
             
@@ -843,6 +847,8 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
                         0
                     ) AS personal_max_jackpot
             
+                    COUNT(*) AS total_spins
+
                 FROM roulette_spins
                 GROUP BY player_id
             ) s ON s.player_id = a.player_id
@@ -915,7 +921,8 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
             balance: Number(row.balance),
             total_earned: Number(row.total_earned),
             jackpots: Number(row.jackpots),
-            personal_max_jackpot: Number(row.personal_max_jackpot)
+            personal_max_jackpot: Number(row.personal_max_jackpot),
+            total_spins: Number(row.total_spins)
         }));
 
         res.json({
