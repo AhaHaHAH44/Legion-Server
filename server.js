@@ -871,6 +871,7 @@ app.get('/api/matches/player/:playerId', async (req, res) => {
                     id: player.id,
                     nickname: player.nickname,
                     mode: player.mode ?? null,
+                    bet: player.bet ?? null,
                     hasMoved: player.move !== null
                 })),
                 winner: match.winner
