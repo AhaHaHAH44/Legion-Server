@@ -353,6 +353,28 @@ app.post('/api/invites', async (req, res) => {
             });
         }
 
+        // Проверяем, не участвует ли кто-либо из игроков в активном матче
+        const activeMatch = await pool.query(
+            `SELECT id
+             FROM knb_matches
+             WHERE status IN ('choosing_mode', 'negotiating', 'playing')
+               AND (
+                   players @> $1::jsonb
+                   OR players @> $2::jsonb
+               )
+             LIMIT 1`,
+            [
+                JSON.stringify([{ id: canonicalFromId }]),
+                JSON.stringify([{ id: canonicalToId }])
+            ]
+        );
+        
+        if (activeMatch.rowCount > 0) {
+            return res.status(409).json({
+                error: 'A player is already in a match'
+            });
+        }
+
         const sender = players.get(canonicalFromId);
         const recipient = players.get(canonicalToId);
 
@@ -365,15 +387,6 @@ app.post('/api/invites', async (req, res) => {
         if (recipient.doNotDisturb) {
             return res.status(403).json({
                 error: 'Player does not accept invitations'
-            });
-        }
-
-        if (
-            getMatchForPlayer(canonicalFromId) ||
-            getMatchForPlayer(canonicalToId)
-        ) {
-            return res.status(409).json({
-                error: 'A player is already in a match'
             });
         }
 
@@ -501,11 +514,11 @@ app.post('/api/invites/:inviteId/respond', async (req, res) => {
             });
         }
 
-        invitations.delete(invite.id);
-
         if (!accept) {
+            invitations.delete(invite.id);
+        
             console.log(`Invitation rejected: ${invite.toNickname}`);
-
+        
             return res.json({
                 success: true,
                 status: 'rejected'
@@ -523,44 +536,294 @@ app.post('/api/invites/:inviteId/respond', async (req, res) => {
 
         const first = players.get(invite.fromId);
         const second = players.get(invite.toId);
+        
+        const matchId = crypto.randomUUID();
+        const createdAt = Date.now();
+        
+        const matchPlayers = [
+            {
+                id: first.id,
+                nickname: first.nickname,
+                mode: null,
+                move: null
+            },
+            {
+                id: second.id,
+                nickname: second.nickname,
+                mode: null,
+                move: null
+            }
+        ];
+        
+        let client;
 
-        const match = {
-            id: crypto.randomUUID(),
-            game: 'rock-paper-scissors',
-            status: 'playing',
-            createdAt: Date.now(),
-            players: [
-                {
-                    id: first.id,
-                    nickname: first.nickname,
-                    move: null
-                },
-                {
-                    id: second.id,
-                    nickname: second.nickname,
-                    move: null
-                }
-            ],
-            winner: null,
-            finishedAt: null
-        };
+        try {
+            client = await pool.connect();
+        
+            await client.query('BEGIN');
+        
+            // Блокируем обоих игроков, чтобы не создать им два матча одновременно
+            await lockRoulettePlayers(client, [first.id, second.id]);
+        
+            // Проверяем, не участвует ли кто-нибудь уже в другом матче Кото-КНБ
+            const active = await client.query(
+                `SELECT id
+                 FROM knb_matches
+                 WHERE status IN (
+                     'choosing_mode',
+                     'negotiating',
+                     'playing'
+                 )
+                 AND (
+                     players @> $1::jsonb
+                     OR players @> $2::jsonb
+                 )
+                 LIMIT 1`,
+                [
+                    JSON.stringify([{ id: first.id }]),
+                    JSON.stringify([{ id: second.id }])
+                ]
+            );
+        
+            if (active.rowCount) {
+                throw new Error('PLAYER_ALREADY_IN_MATCH');
+            }
+        
+            // Создаём матч в PostgreSQL
+            await client.query(
+                `INSERT INTO knb_matches (
+                    id,
+                    status,
+                    players,
+                    created_at
+                )
+                VALUES ($1, 'choosing_mode', $2::jsonb, $3)`,
+                [
+                    matchId,
+                    JSON.stringify(matchPlayers),
+                    createdAt
+                ]
+            );
+        
+            await client.query('COMMIT');
+        
+        } catch (error) {
+            if (client) {
+                await client.query('ROLLBACK').catch(() => {});
+            }
+        
+            throw error;
+        } finally {
+            if (client) {
+                client.release();
+            }
+        }
 
-        matches.set(match.id, match);
-
+        invitations.delete(invite.id);
+        
         console.log(
-            `Match created: ${first.nickname} vs ${second.nickname}`
+            `Koto-KNB match created: ${first.nickname} vs ${second.nickname}`
         );
-
+        
         return res.json({
             success: true,
             status: 'accepted',
-            matchId: match.id
+            matchId
         });
-
+        
     } catch (error) {
         console.error('Invitation response failed:', error);
-
+    
+        if (error.message === 'PLAYER_ALREADY_IN_MATCH') {
+            return res.status(409).json({
+                error: 'A player is already in a match'
+            });
+        }
+    
         return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+    }
+});
+
+// ========================================
+// KNB MATCH EXPIRATION
+// ========================================
+
+async function expireKnbMatches() {
+    const expired = await pool.query(
+        `SELECT id
+         FROM knb_matches
+         WHERE status IN (
+             'choosing_mode',
+             'negotiating',
+             'playing'
+         )
+         AND updated_at < NOW() - INTERVAL '5 minutes'
+         ORDER BY updated_at
+         LIMIT 30`
+    );
+
+    for (const item of expired.rows) {
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            const result = await client.query(
+                `SELECT *
+                 FROM knb_matches
+                 WHERE id = $1
+                 FOR UPDATE`,
+                [item.id]
+            );
+
+            if (!result.rowCount) {
+                await client.query('ROLLBACK');
+                continue;
+            }
+
+            const match = result.rows[0];
+
+            // Повторно проверяем срок после получения блокировки
+            if (
+                !['choosing_mode', 'negotiating', 'playing']
+                    .includes(match.status) ||
+                new Date(match.updated_at).getTime() >=
+                    Date.now() - 5 * 60 * 1000
+            ) {
+                await client.query('ROLLBACK');
+                continue;
+            }
+
+                        // Возвращаем ставки только в завершившейся по таймауту
+            // ставочной игре, где деньги уже были зарезервированы
+            if (
+                match.status === 'playing' &&
+                match.mode === 'betting'
+            ) {
+                const stake = Number(match.stake);
+
+                if (
+                    !Number.isSafeInteger(stake) ||
+                    stake < 50
+                ) {
+                    throw new Error('INVALID_RESERVED_STAKE');
+                }
+
+                // Проверяем, что обе ставки действительно были списаны
+                const ledger = await client.query(
+                    `SELECT player_id, amount
+                     FROM knb_transactions
+                     WHERE match_id = $1
+                       AND type = 'stake'`,
+                    [match.id]
+                );
+
+                if (
+                    ledger.rowCount !== 2 ||
+                    ledger.rows.some(row => Number(row.amount) !== stake) ||
+                    match.players.some(player =>
+                        !ledger.rows.some(
+                            row => String(row.player_id) === String(player.id)
+                        )
+                    )
+                ) {
+                    throw new Error('INCOMPLETE_STAKE_LEDGER');
+                }
+
+                // Возвращаем деньги обоим игрокам
+                for (const player of match.players) {
+                    const refund = await client.query(
+                        `INSERT INTO knb_transactions
+                            (match_id, player_id, type, amount, details)
+                         VALUES ($1, $2, 'refund', $3, $4::jsonb)
+                         ON CONFLICT (match_id, player_id, type)
+                         DO NOTHING
+                         RETURNING id`,
+                        [
+                            match.id,
+                            player.id,
+                            stake,
+                            JSON.stringify({ reason: 'timeout' })
+                        ]
+                    );
+
+                    // Начисляем деньги только при новой записи возврата
+                    if (refund.rowCount > 0) {
+                        const update = await client.query(
+                            `UPDATE roulette_accounts
+                             SET balance = balance + $2,
+                                 updated_at = NOW()
+                             WHERE player_id = $1`,
+                            [player.id, stake]
+                        );
+
+                        if (update.rowCount !== 1) {
+                            throw new Error('REFUND_ACCOUNT_NOT_FOUND');
+                        }
+                    }
+                }
+            }
+            await client.query(
+                `UPDATE knb_matches
+                 SET status = 'expired',
+                     finished_at = NOW(),
+                     updated_at = NOW()
+                 WHERE id = $1`,
+                [match.id]
+            );
+
+            await client.query('COMMIT');
+
+            console.log(`KNB match expired: ${match.id}`);
+
+        } catch (error) {
+            await client.query('ROLLBACK').catch(() => {});
+
+            console.error(
+                'KNB match expiration failed:',
+                item.id,
+            );
+
+        } finally {
+            client.release();
+        }
+    }
+}
+
+// Запускаем очистку не чаще одного раза в 5 секунд
+let knbCleanupPromise = null;
+let knbLastCleanup = 0;
+
+async function ensureKnbCleanup() {
+    if (
+        !knbCleanupPromise &&
+        Date.now() - knbLastCleanup > 5000
+    ) {
+        knbCleanupPromise = expireKnbMatches()
+            .then(() => {
+                knbLastCleanup = Date.now();
+            })
+            .finally(() => {
+                knbCleanupPromise = null;
+            });
+    }
+
+    if (knbCleanupPromise) {
+        await knbCleanupPromise;
+    }
+}
+
+// Проверяем истёкшие матчи перед обработкой запросов Кото-КНБ
+app.use('/api/matches', async (req, res, next) => {
+    try {
+        await ensureKnbCleanup();
+        next();
+    } catch (error) {
+        console.error('KNB cleanup failed:', error);
+
+        res.status(503).json({
             error: 'Database temporarily unavailable'
         });
     }
@@ -575,24 +838,39 @@ app.get('/api/matches/player/:playerId', async (req, res) => {
 
     try {
         const playerId = await resolvePlayerId(req.params.playerId);
-        const match = getMatchForPlayer(playerId);
 
-        if (!match) {
+        const result = await pool.query(
+            `SELECT id, status, mode, players, stake, pot, winner
+             FROM knb_matches
+             WHERE status IN ('choosing_mode', 'negotiating', 'playing')
+             AND players @> $1::jsonb
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [JSON.stringify([{ id: playerId }])]
+        );
+
+        if (result.rowCount === 0) {
             return res.json({
                 success: true,
                 match: null
             });
         }
 
+        const match = result.rows[0];
+
         return res.json({
             success: true,
             match: {
                 id: match.id,
-                game: match.game,
+                game: 'rock-paper-scissors',
                 status: match.status,
+                mode: match.mode,
+                stake: match.stake,
+                pot: match.pot,
                 players: match.players.map(player => ({
                     id: player.id,
                     nickname: player.nickname,
+                    mode: player.mode ?? null,
                     hasMoved: player.move !== null
                 })),
                 winner: match.winner
@@ -609,21 +887,564 @@ app.get('/api/matches/player/:playerId', async (req, res) => {
 });
 
 // ========================================
+// CHOOSE KNB MODE
+// ========================================
+
+app.post('/api/matches/:matchId/mode', async (req, res) => {
+    const { playerId, mode } = req.body || {};
+
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
+    }
+
+    if (!['free', 'betting'].includes(mode)) {
+        return res.status(400).json({
+            error: 'Invalid game mode'
+        });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        await client.query('BEGIN');
+
+        const result = await client.query(
+            `SELECT id, status, mode, players
+             FROM knb_matches
+             WHERE id = $1
+             FOR UPDATE`,
+            [req.params.matchId]
+        );
+
+        if (!result.rowCount) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+                error: 'Match not found'
+            });
+        }
+
+        const match = result.rows[0];
+
+        if (match.status !== 'choosing_mode') {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                error: 'Mode selection is no longer available'
+            });
+        }
+
+        const players = match.players;
+
+        const player = players.find(p => p.id === canonicalId);
+
+        if (!player) {
+            await client.query('ROLLBACK');
+
+            return res.status(403).json({
+                error: 'You are not a participant'
+            });
+        }
+
+        // Для ставок разблокировка должна быть у обоих игроков
+        if (mode === 'betting') {
+            const ownership = await client.query(
+                `SELECT player_id
+                 FROM player_purchases
+                 WHERE item_code = 'knb_betting'
+                 AND player_id = ANY($1::text[])`,
+                [players.map(p => p.id)]
+            );
+
+            if (ownership.rowCount !== 2) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    error: 'BETTING_LOCK_REQUIRED'
+                });
+            }
+        }
+
+        // Сохраняем выбор текущего игрока
+        player.mode = mode;
+
+        const bothSelected = players.every(p => p.mode !== null);
+
+        const sameMode = bothSelected &&
+            players[0].mode === players[1].mode;
+
+        let status = 'choosing_mode';
+        let selectedMode = null;
+
+        if (sameMode) {
+            selectedMode = mode;
+            status = mode === 'free'
+                ? 'playing'
+                : 'negotiating';
+        }
+
+        await client.query(
+            `UPDATE knb_matches
+             SET players = $1::jsonb,
+                 mode = $2,
+                 status = $3,
+                 updated_at = NOW()
+             WHERE id = $4`,
+            [
+                JSON.stringify(players),
+                selectedMode,
+                status,
+                match.id
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            status,
+            mode: selectedMode,
+            waitingForOpponent: !bothSelected,
+            modeMismatch: bothSelected && !sameMode
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+
+        console.error('KNB mode selection failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+// ========================================
+// SUBMIT KNB BET
+// ========================================
+
+app.post('/api/matches/:matchId/bet', async (req, res) => {
+    const { playerId, amount } = req.body || {};
+
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
+    }
+
+    const stake = Number(amount);
+
+    if (!Number.isSafeInteger(stake) || stake < 50) {
+        return res.status(400).json({
+            error: 'Минимальная ставка — 50 мяукоинов'
+        });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        await client.query('BEGIN');
+
+        // Блокируем матч на время согласования ставок
+        const result = await client.query(
+            `SELECT id, status, mode, players, stake, pot
+             FROM knb_matches
+             WHERE id = $1
+             FOR UPDATE`,
+            [req.params.matchId]
+        );
+
+        if (!result.rowCount) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+                error: 'Match not found'
+            });
+        }
+
+        const match = result.rows[0];
+
+        if (
+            match.status !== 'negotiating' ||
+            match.mode !== 'betting'
+        ) {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                error: 'Match is not accepting bets'
+            });
+        }
+
+        const players = match.players;
+
+        const player = players.find(p => p.id === canonicalId);
+
+        if (!player) {
+            await client.query('ROLLBACK');
+
+            return res.status(403).json({
+                error: 'You are not a participant'
+            });
+        }
+
+        // Проверяем, что оба игрока купили разблокировку
+        const ownership = await client.query(
+            `SELECT player_id
+             FROM player_purchases
+             WHERE item_code = 'knb_betting'
+             AND player_id = ANY($1::text[])`,
+            [players.map(p => p.id)]
+        );
+
+        if (ownership.rowCount !== 2) {
+            await client.query('ROLLBACK');
+
+            return res.status(403).json({
+                error: 'BETTING_LOCK_REQUIRED'
+            });
+        }
+
+        // Проверяем баланс игрока, который сейчас предлагает ставку
+        const account = await client.query(
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1`,
+            [canonicalId]
+        );
+
+        if (
+            !account.rowCount ||
+            Number(account.rows[0].balance) < stake
+        ) {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                error: 'INSUFFICIENT_BALANCE'
+            });
+        }
+
+        // Сохраняем предложение игрока
+        player.bet = stake;
+
+        const other = players.find(p => p.id !== canonicalId);
+
+        const betsMatch = other && other.bet === stake;
+
+        // Если ставки ещё не совпали — сохраняем предложение
+        if (!betsMatch) {
+            await client.query(
+                `UPDATE knb_matches
+                 SET players = $1::jsonb,
+                     updated_at = NOW()
+                 WHERE id = $2`,
+                [JSON.stringify(players), match.id]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                success: true,
+                status: 'negotiating',
+                waitingForOpponent: true,
+                players: players.map(p => ({
+                    id: p.id,
+                    nickname: p.nickname,
+                    bet: p.bet ?? null
+                }))
+            });
+        }
+
+        // Обе ставки совпали. Блокируем счета обоих игроков.
+        const playerIds = players.map(p => p.id).sort();
+
+        const balances = await client.query(
+            `SELECT player_id, balance
+             FROM roulette_accounts
+             WHERE player_id = ANY($1::text[])
+             ORDER BY player_id
+             FOR UPDATE`,
+            [playerIds]
+        );
+
+        if (
+            balances.rowCount !== 2 ||
+            balances.rows.some(
+                row => Number(row.balance) < stake
+            )
+        ) {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                error: 'INSUFFICIENT_BALANCE'
+            });
+        }
+
+        // Резервируем одинаковую сумму у обоих игроков
+        for (const p of players) {
+            const debit = await client.query(
+                `UPDATE roulette_accounts
+                 SET balance = balance - $2,
+                     updated_at = NOW()
+                 WHERE player_id = $1
+                 AND balance >= $2`,
+                [p.id, stake]
+            );
+
+            if (debit.rowCount !== 1) {
+                throw new Error('INSUFFICIENT_BALANCE');
+            }
+
+            await client.query(
+                `INSERT INTO knb_transactions
+                    (match_id, player_id, type, amount, details)
+                 VALUES ($1, $2, 'stake', $3, $4::jsonb)`,
+                [
+                    match.id,
+                    p.id,
+                    stake,
+                    JSON.stringify({
+                        nickname: p.nickname
+                    })
+                ]
+            );
+        }
+
+        const pot = stake * 2;
+
+        // Матч готов к игре
+        await client.query(
+            `UPDATE knb_matches
+             SET players = $1::jsonb,
+                 stake = $2,
+                 pot = $3,
+                 status = 'playing',
+                 updated_at = NOW()
+             WHERE id = $4`,
+            [
+                JSON.stringify(players),
+                stake,
+                pot,
+                match.id
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            status: 'playing',
+            stake,
+            pot,
+            players: players.map(p => ({
+                id: p.id,
+                nickname: p.nickname,
+                bet: p.bet
+            }))
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+
+        console.error('KNB bet submission failed:', error);
+
+        if (error.message === 'INSUFFICIENT_BALANCE') {
+            return res.status(409).json({
+                error: 'INSUFFICIENT_BALANCE'
+            });
+        }
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+// CANCEL KNB MATCH
+    app.post('/api/matches/:matchId/cancel', async (req, res) => {
+    const { matchId } = req.params;
+    const { playerId } = req.body || {};
+
+    if (!playerId) {
+        return res.status(400).json({
+            success: false,
+            error: 'PLAYER_ID_REQUIRED'
+        });
+    }
+
+    let client;
+
+    try {
+        client = await pool.connect();
+
+        await client.query('BEGIN');
+
+        const resolvedPlayerId = await resolvePlayerId(playerId, client);
+
+        const result = await client.query(
+            `SELECT *
+             FROM knb_matches
+             WHERE id = $1
+             FOR UPDATE`,
+            [matchId]
+        );
+
+        if (!result.rowCount) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+                success: false,
+                error: 'MATCH_NOT_FOUND'
+            });
+        }
+
+        const match = result.rows[0];
+
+        const player = match.players.find(
+            p => String(p.id) === String(resolvedPlayerId)
+        );
+
+        if (!player) {
+            await client.query('ROLLBACK');
+
+            return res.status(403).json({
+                success: false,
+                error: 'NOT_A_MATCH_PLAYER'
+            });
+        }
+
+        const activeStatuses = [
+            'choosing_mode',
+            'negotiating',
+            'playing'
+        ];
+
+        if (!activeStatuses.includes(match.status)) {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                success: false,
+                error: 'MATCH_NOT_ACTIVE'
+            });
+        }
+
+        let refunded = false;
+
+        // Возвращаем ставки, если они уже были списаны
+        if (match.status === 'playing' && match.mode === 'betting') {
+            const stake = Number(match.stake);
+
+            if (!Number.isSafeInteger(stake) || stake < 50) {
+                throw new Error('INVALID_MATCH_STAKE');
+            }
+
+            const ledger = await client.query(
+                `SELECT player_id, amount
+                 FROM knb_transactions
+                 WHERE match_id = $1
+                   AND type = 'stake'`,
+                [matchId]
+            );
+
+            if (
+                ledger.rowCount !== 2 ||
+                ledger.rows.some(row => Number(row.amount) !== stake) ||
+                match.players.some(p =>
+                    !ledger.rows.some(
+                        row => String(row.player_id) === String(p.id)
+                    )
+                )
+            ) {
+                throw new Error('INCOMPLETE_STAKE_LEDGER');
+            }
+
+            for (const matchPlayer of match.players) {
+                const refund = await client.query(
+                    `INSERT INTO knb_transactions
+                        (match_id, player_id, type, amount, details)
+                     VALUES ($1, $2, 'refund', $3, $4::jsonb)
+                     ON CONFLICT (match_id, player_id, type)
+                     DO NOTHING
+                     RETURNING id`,
+                    [
+                        matchId,
+                        matchPlayer.id,
+                        stake,
+                        JSON.stringify({ reason: 'match_cancelled' })
+                    ]
+                );
+
+                if (refund.rowCount > 0) {
+                    const accountUpdate = await client.query(
+                        `UPDATE roulette_accounts
+                         SET balance = balance + $2,
+                             updated_at = NOW()
+                         WHERE player_id = $1`,
+                        [matchPlayer.id, stake]
+                    );
+
+                    if (accountUpdate.rowCount !== 1) {
+                        throw new Error('REFUND_ACCOUNT_NOT_FOUND');
+                    }
+                }
+            }
+
+            refunded = true;
+        }
+
+        await client.query(
+            `UPDATE knb_matches
+             SET status = 'cancelled',
+                 finished_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [matchId]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            status: 'cancelled',
+            refunded
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        console.error('[KNB CANCEL ERROR]', error);
+
+        return res.status(503).json({
+            success: false,
+            error: error.message || 'CANCEL_FAILED'
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// ========================================
 // SUBMIT MOVE
 // ========================================
 
 app.post('/api/matches/:matchId/move', async (req, res) => {
-    cleanup();
-
     const { playerId, move } = req.body || {};
-
-    const match = matches.get(req.params.matchId);
-
-    if (!match || match.status !== 'playing') {
-        return res.status(404).json({
-            error: 'Match not found or finished'
-        });
-    }
 
     if (!['rock', 'paper', 'scissors'].includes(move)) {
         return res.status(400).json({
@@ -637,17 +1458,54 @@ app.post('/api/matches/:matchId/move', async (req, res) => {
         });
     }
 
+    const client = await pool.connect();
+
     try {
         const canonicalId = await resolvePlayerId(playerId);
-        const player = match.players.find(p => p.id === canonicalId);
+
+        await client.query('BEGIN');
+
+        const result = await client.query(
+            `SELECT *
+             FROM knb_matches
+             WHERE id = $1
+             FOR UPDATE`,
+            [req.params.matchId]
+        );
+
+        if (!result.rowCount) {
+            await client.query('ROLLBACK');
+
+            return res.status(404).json({
+                error: 'Match not found'
+            });
+        }
+
+        const match = result.rows[0];
+
+        if (match.status !== 'playing') {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                error: 'Match is not playing'
+            });
+        }
+
+        const players = match.players;
+
+        const player = players.find(p => p.id === canonicalId);
 
         if (!player) {
+            await client.query('ROLLBACK');
+
             return res.status(403).json({
                 error: 'You are not a participant'
             });
         }
 
         if (player.move !== null) {
+            await client.query('ROLLBACK');
+
             return res.status(409).json({
                 error: 'You have already moved'
             });
@@ -655,37 +1513,194 @@ app.post('/api/matches/:matchId/move', async (req, res) => {
 
         player.move = move;
 
-        console.log(`Move submitted in match ${match.id}`);
+        const bothMoved = players.every(p => p.move !== null);
 
-        const bothMoved = match.players.every(p => p.move !== null);
+        let winner = null;
+        let status = 'playing';
+        let payout = 0;
+        let refund = false;
 
         if (bothMoved) {
             const result = getWinner(
-                match.players[0].move,
-                match.players[1].move
+                players[0].move,
+                players[1].move
             );
 
-            match.winner = result === 'draw'
+            winner = result === 'draw'
                 ? 'draw'
-                : match.players[result === 'first' ? 0 : 1].id;
+                : players[result === 'first' ? 0 : 1].id;
 
-            match.status = 'finished';
-            match.finishedAt = Date.now();
+            status = 'finished';
 
-            console.log(`Match finished: ${match.winner}`);
+            // Расчёт для игры на мяукоины
+            if (match.mode === 'betting') {
+                const stake = Number(match.stake);
+                const pot = Number(match.pot);
+
+                if (
+                    !Number.isSafeInteger(stake) ||
+                    stake < 50 ||
+                    !Number.isSafeInteger(pot) ||
+                    pot !== stake * 2
+                ) {
+                    throw new Error('INVALID_BET_DATA');
+                }
+
+                 // Проверяем, что обе ставки действительно были списаны
+                const ledger = await client.query(
+                    `SELECT player_id, amount
+                     FROM knb_transactions
+                     WHERE match_id = $1
+                       AND type = 'stake'`,
+                    [match.id]
+                );
+
+                if (
+                    ledger.rowCount !== 2 ||
+                    ledger.rows.some(
+                        row => Number(row.amount) !== stake
+                    ) ||
+                    players.some(player =>
+                        !ledger.rows.some(
+                            row =>
+                                String(row.player_id) === String(player.id)
+                        )
+                    )
+                ) {
+                    throw new Error('INCOMPLETE_STAKE_LEDGER');
+                }
+
+                const playerIds = players
+                    .map(p => p.id)
+                    .sort();
+
+                // Блокируем счета обоих игроков
+                const accounts = await client.query(
+                    `SELECT player_id, balance
+                     FROM roulette_accounts
+                     WHERE player_id = ANY($1::text[])
+                     ORDER BY player_id
+                     FOR UPDATE`,
+                    [playerIds]
+                );
+
+                if (accounts.rowCount !== 2) {
+                    throw new Error('PLAYER_ACCOUNT_NOT_FOUND');
+                }
+
+                if (winner === 'draw') {
+                    // При ничьей возвращаем каждому его ставку
+                    for (const p of players) {
+                        const update = await client.query(
+                            `UPDATE roulette_accounts
+                             SET balance = balance + $2,
+                                 updated_at = NOW()
+                             WHERE player_id = $1`,
+                            [p.id, stake]
+                        );
+
+                        if (update.rowCount !== 1) {
+                            throw new Error('REFUND_FAILED');
+                        }
+
+                        await client.query(
+                            `INSERT INTO knb_transactions
+                                (match_id, player_id, type, amount, details)
+                             VALUES ($1, $2, 'refund', $3, $4::jsonb)`,
+                            [
+                                match.id,
+                                p.id,
+                                stake,
+                                JSON.stringify({
+                                    reason: 'draw'
+                                })
+                            ]
+                        );
+                    }
+
+                    refund = true;
+
+                } else {
+                    // Победитель получает весь банк
+                    const update = await client.query(
+                        `UPDATE roulette_accounts
+                         SET balance = balance + $2,
+                             updated_at = NOW()
+                         WHERE player_id = $1`,
+                        [winner, pot]
+                    );
+
+                    if (update.rowCount !== 1) {
+                        throw new Error('PAYOUT_FAILED');
+                    }
+
+                    await client.query(
+                        `INSERT INTO knb_transactions
+                            (match_id, player_id, type, amount, details)
+                         VALUES ($1, $2, 'payout', $3, $4::jsonb)`,
+                        [
+                            match.id,
+                            winner,
+                            pot,
+                            JSON.stringify({
+                                stake,
+                                pot
+                            })
+                        ]
+                    );
+
+                    payout = pot;
+                }
+            }
+        }
+
+        await client.query(
+            `UPDATE knb_matches
+             SET players = $1::jsonb,
+                 status = $2,
+                 winner = $3,
+                 finished_at = CASE
+                     WHEN $2 = 'finished' THEN NOW()
+                     ELSE finished_at
+                 END,
+                 updated_at = NOW()
+             WHERE id = $4`,
+            [
+                JSON.stringify(players),
+                status,
+                winner,
+                match.id
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        if (bothMoved) {
+            console.log(
+                `KNB match finished: ${winner}, mode: ${match.mode}`
+            );
         }
 
         return res.json({
             success: true,
-            waitingForOpponent: !bothMoved
+            waitingForOpponent: !bothMoved,
+            status,
+            winner: bothMoved ? winner : null,
+            payout,
+            refund
         });
 
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+
         console.error('Move submission failed:', error);
 
         return res.status(503).json({
             error: 'Database temporarily unavailable'
         });
+
+    } finally {
+        client.release();
     }
 });
 
@@ -694,16 +1709,7 @@ app.post('/api/matches/:matchId/move', async (req, res) => {
 // ========================================
 
 app.get('/api/matches/:matchId', async (req, res) => {
-    cleanup();
-
     const { playerId } = req.query;
-    const match = matches.get(req.params.matchId);
-
-    if (!match) {
-        return res.status(404).json({
-            error: 'Match not found'
-        });
-    }
 
     if (typeof playerId !== 'string') {
         return res.status(400).json({
@@ -713,7 +1719,25 @@ app.get('/api/matches/:matchId', async (req, res) => {
 
     try {
         const canonicalId = await resolvePlayerId(playerId);
-        const currentPlayer = match.players.find(p => p.id === canonicalId);
+
+        const result = await pool.query(
+            `SELECT id, status, mode, players, stake, pot, winner
+             FROM knb_matches
+             WHERE id = $1`,
+            [req.params.matchId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({
+                error: 'Match not found'
+            });
+        }
+
+        const match = result.rows[0];
+
+        const currentPlayer = match.players.find(
+            player => player.id === canonicalId
+        );
 
         if (!currentPlayer) {
             return res.status(403).json({
@@ -721,13 +1745,18 @@ app.get('/api/matches/:matchId', async (req, res) => {
             });
         }
 
-        const bothMoved = match.players.every(p => p.move !== null);
+        const bothMoved = match.players.every(
+            player => player.move !== null
+        );
 
         return res.json({
             success: true,
             match: {
                 id: match.id,
                 status: match.status,
+                mode: match.mode,
+                stake: match.stake,
+                pot: match.pot,
                 players: match.players.map(player => ({
                     id: player.id,
                     nickname: player.nickname,
@@ -746,7 +1775,6 @@ app.get('/api/matches/:matchId', async (req, res) => {
         });
     }
 });
-
 
 // ========================================
 // КОТО-РУЛЕТКА
@@ -2346,55 +3374,124 @@ async function initializeDatabase() {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_transactions_match_player_type
             ON roulette_transactions (match_id, player_id, type);
 
-                    -- ========================================
-        -- LEGION SHOP
-        -- ========================================
+            -- ========================================
+            -- KOTO-KNB MATCHES
+            -- ========================================
+            
+            CREATE TABLE IF NOT EXISTS knb_matches (
+                id UUID PRIMARY KEY,
+            
+                status TEXT NOT NULL
+                    CHECK (status IN (
+                        'choosing_mode',
+                        'negotiating',
+                        'playing',
+                        'finished',
+                        'cancelled',
+                        'expired'
+                    )),
+            
+                mode TEXT
+                    CHECK (mode IS NULL OR mode IN ('free', 'betting')),
+            
+                players JSONB NOT NULL,
+            
+                stake INTEGER
+                    CHECK (stake IS NULL OR stake >= 50),
+            
+                pot INTEGER
+                    CHECK (pot IS NULL OR pot >= 0),
+            
+                winner TEXT,
+            
+                created_at BIGINT NOT NULL,
+                finished_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
 
-        CREATE TABLE IF NOT EXISTS shop_items (
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL,
-            category TEXT NOT NULL
-                CHECK (category IN ('cosmetic', 'unlock', 'boost')),
-            price INTEGER NOT NULL CHECK (price >= 0),
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
+            CREATE TABLE IF NOT EXISTS knb_transactions (
+                id BIGSERIAL PRIMARY KEY,
+            
+                match_id UUID NOT NULL
+                    REFERENCES knb_matches(id),
+            
+                player_id TEXT NOT NULL
+                    REFERENCES roulette_accounts(player_id),
+            
+                type TEXT NOT NULL
+                    CHECK (type IN ('stake', 'payout', 'refund')),
+            
+                amount NUMERIC(14,2) NOT NULL
+                    CHECK (amount > 0),
+            
+                details JSONB NOT NULL DEFAULT '{}'::jsonb,
+            
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            
+                UNIQUE (match_id, player_id, type)
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_knb_transactions_player
+                ON knb_transactions (player_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_knb_transactions_match
+                ON knb_transactions (match_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_knb_matches_players
+                ON knb_matches USING GIN (players);
+            
+            CREATE INDEX IF NOT EXISTS idx_knb_matches_status
+                ON knb_matches (status, created_at DESC);
 
-        CREATE TABLE IF NOT EXISTS player_purchases (
-            id BIGSERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL
-                REFERENCES roulette_accounts(player_id),
-            item_code TEXT NOT NULL
-                REFERENCES shop_items(code),
-            price_paid INTEGER NOT NULL CHECK (price_paid >= 0),
-            purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-            UNIQUE (player_id, item_code)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_player_purchases_player
-            ON player_purchases (player_id);
-
-        -- Первый товар магазина: разблокировка ставок в Кото-КНБ
-        INSERT INTO shop_items (
-            code,
-            name,
-            description,
-            category,
-            price,
-            is_active
-        )
-        VALUES (
-            'knb_betting',
-            'Ставки в Кото-КНБ',
-            'Навсегда открывает возможность играть на мяукоины в Кото-КНБ.',
-            'unlock',
-            750,
-            TRUE
-        )
-        ON CONFLICT (code) DO NOTHING;
+            -- ========================================
+            -- LEGION SHOP
+            -- ========================================
+    
+            CREATE TABLE IF NOT EXISTS shop_items (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL
+                    CHECK (category IN ('cosmetic', 'unlock', 'boost')),
+                price INTEGER NOT NULL CHECK (price >= 0),
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+    
+            CREATE TABLE IF NOT EXISTS player_purchases (
+                id BIGSERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL
+                    REFERENCES roulette_accounts(player_id),
+                item_code TEXT NOT NULL
+                    REFERENCES shop_items(code),
+                price_paid INTEGER NOT NULL CHECK (price_paid >= 0),
+                purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+                UNIQUE (player_id, item_code)
+            );
+    
+            CREATE INDEX IF NOT EXISTS idx_player_purchases_player
+                ON player_purchases (player_id);
+    
+            -- Первый товар магазина: разблокировка ставок в Кото-КНБ
+            INSERT INTO shop_items (
+                code,
+                name,
+                description,
+                category,
+                price,
+                is_active
+            )
+            VALUES (
+                'knb_betting',
+                'Ставки в Кото-КНБ',
+                'Навсегда открывает возможность играть на мяукоины в Кото-КНБ.',
+                'unlock',
+                750,
+                TRUE
+            )
+            ON CONFLICT (code) DO NOTHING;
     `);
     console.log('PostgreSQL schema is ready.');
 }
