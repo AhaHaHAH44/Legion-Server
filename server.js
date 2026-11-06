@@ -49,6 +49,20 @@ const MATCH_TIMEOUT = 300000;
 // HELPERS
 // ========================================
 
+// Преобразует дополнительный UUID в основной UUID аккаунта
+async function resolvePlayerId(playerId, db = pool) {
+    const result = await db.query(
+        `SELECT player_id
+         FROM roulette_player_aliases
+         WHERE alias_id = $1`,
+        [playerId]
+    );
+
+    return result.rowCount
+        ? result.rows[0].player_id
+        : playerId;
+}
+
 function cleanup() {
     const now = Date.now();
 
@@ -205,38 +219,47 @@ app.post('/api/players/heartbeat', async (req, res) => {
     cleanup();
 
     const cleanNickname = nickname.trim();
-    const existingPlayer = players.get(id);
-    const isNew = !existingPlayer;
 
     try {
+        const canonicalId = await resolvePlayerId(id);
+
+        const existingPlayer = players.get(canonicalId);
+        const isNew = !existingPlayer;
+
         await pool.query(
-            `INSERT INTO roulette_accounts (player_id, nickname) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET nickname = EXCLUDED.nickname`,
-            [id, cleanNickname]
+            `INSERT INTO roulette_accounts (player_id, nickname)
+             VALUES ($1, $2)
+             ON CONFLICT (player_id)
+             DO UPDATE SET nickname = EXCLUDED.nickname`,
+            [canonicalId, cleanNickname]
         );
+
+        players.set(canonicalId, {
+            id: canonicalId,
+            nickname: cleanNickname,
+            lastSeen: Date.now(),
+            doNotDisturb: doNotDisturb !== undefined
+                ? doNotDisturb
+                : (existingPlayer?.doNotDisturb ?? false)
+        });
+
+        if (isNew) {
+            console.log(`Player joined: ${cleanNickname} (${canonicalId})`);
+        }
+
+        return res.json({
+            success: true,
+            playerId: canonicalId,
+            doNotDisturb: players.get(canonicalId).doNotDisturb
+        });
+
     } catch (error) {
         console.error('Player balance registration failed:', error);
-        return res.status(503).json({ error: 'Database temporarily unavailable' });
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
-
-    players.set(id, {
-        id,
-        nickname: cleanNickname,
-        lastSeen: Date.now(),
-        doNotDisturb: doNotDisturb !== undefined
-            ? doNotDisturb
-            : (existingPlayer?.doNotDisturb ?? false)
-    });
-
-    if (isNew) {
-        console.log(`Player joined: ${cleanNickname} (${id})`);
-    }
-
-    res.json({
-        success: true,
-        playerId: id,
-        doNotDisturb: players.get(id).doNotDisturb
-    });
 });
 
 // ========================================
