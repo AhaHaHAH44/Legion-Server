@@ -2026,6 +2026,219 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
 });
 
 // ========================================
+// LEGION SHOP API
+// ========================================
+
+// Получить каталог магазина, баланс и купленные товары
+app.get('/api/shop/:playerId', async (req, res) => {
+    try {
+        const playerId = await resolvePlayerId(req.params.playerId);
+
+        const account = await pool.query(
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1`,
+            [playerId]
+        );
+
+        if (!account.rowCount) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        const items = await pool.query(
+            `SELECT
+                s.code,
+                s.name,
+                s.description,
+                s.category,
+                s.price,
+                s.metadata,
+                (p.id IS NOT NULL) AS owned
+             FROM shop_items s
+             LEFT JOIN player_purchases p
+                ON p.item_code = s.code
+                AND p.player_id = $1
+             WHERE s.is_active = TRUE
+             ORDER BY s.created_at ASC`,
+            [playerId]
+        );
+
+        return res.json({
+            success: true,
+            balance: Number(account.rows[0].balance),
+            items: items.rows.map(item => ({
+                ...item,
+                price: Number(item.price),
+                owned: item.owned
+            }))
+        });
+
+    } catch (error) {
+        console.error('Shop catalog failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+    }
+});
+
+
+// Купить товар
+app.post('/api/shop/purchase', async (req, res) => {
+    const { playerId, itemCode } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        !playerId.trim() ||
+        typeof itemCode !== 'string' ||
+        !itemCode.trim()
+    ) {
+        return res.status(400).json({
+            error: 'Invalid purchase data'
+        });
+    }
+
+    let client;
+
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Получаем основной UUID игрока
+        const canonicalId = await resolvePlayerId(playerId, client);
+
+        // Блокируем аккаунт на время покупки
+        const account = await client.query(
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Проверяем существование и доступность товара
+        const item = await client.query(
+            `SELECT code, name, price, category
+             FROM shop_items
+             WHERE code = $1 AND is_active = TRUE`,
+            [itemCode]
+        );
+
+        if (!item.rowCount) {
+            throw new Error('ITEM_NOT_FOUND');
+        }
+
+        const product = item.rows[0];
+        const price = Number(product.price);
+        const balance = Number(account.rows[0].balance);
+
+        // Проверяем, не куплен ли товар ранее
+        const existing = await client.query(
+            `SELECT id
+             FROM player_purchases
+             WHERE player_id = $1 AND item_code = $2`,
+            [canonicalId, itemCode]
+        );
+
+        if (existing.rowCount) {
+            throw new Error('ALREADY_OWNED');
+        }
+
+        // Проверяем баланс
+        if (balance < price) {
+            throw new Error('INSUFFICIENT_BALANCE');
+        }
+
+        // Списываем мяукоины
+        const updatedAccount = await client.query(
+            `UPDATE roulette_accounts
+             SET balance = balance - $2,
+                 updated_at = NOW()
+             WHERE player_id = $1
+               AND balance >= $2
+             RETURNING balance`,
+            [canonicalId, price]
+        );
+
+        if (!updatedAccount.rowCount) {
+            throw new Error('INSUFFICIENT_BALANCE');
+        }
+
+        // Записываем покупку
+        await client.query(
+            `INSERT INTO player_purchases
+                (player_id, item_code, price_paid)
+             VALUES ($1, $2, $3)`,
+            [canonicalId, itemCode, price]
+        );
+
+        // Сохраняем операцию в истории транзакций
+        await client.query(
+            `INSERT INTO roulette_transactions
+                (player_id, type, amount, details)
+             VALUES ($1, 'shop_purchase', $2, $3::jsonb)`,
+            [
+                canonicalId,
+                -price,
+                JSON.stringify({
+                    itemCode: product.code,
+                    itemName: product.name,
+                    category: product.category
+                })
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            message: 'Purchase successful',
+            item: {
+                code: product.code,
+                name: product.name,
+                category: product.category
+            },
+            price,
+            balance: Number(updatedAccount.rows[0].balance)
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [404, 'Player not found'],
+            ITEM_NOT_FOUND: [404, 'Товар не найден или больше недоступен'],
+            ALREADY_OWNED: [409, 'Этот товар уже куплен'],
+            INSUFFICIENT_BALANCE: [409, 'Недостаточно мяукоинов']
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Shop purchase failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// ========================================
 // START SERVER
 // ========================================
 
@@ -2132,6 +2345,56 @@ async function initializeDatabase() {
             ON roulette_matches (created_at DESC);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_transactions_match_player_type
             ON roulette_transactions (match_id, player_id, type);
+
+                    -- ========================================
+        -- LEGION SHOP
+        -- ========================================
+
+        CREATE TABLE IF NOT EXISTS shop_items (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL
+                CHECK (category IN ('cosmetic', 'unlock', 'boost')),
+            price INTEGER NOT NULL CHECK (price >= 0),
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS player_purchases (
+            id BIGSERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL
+                REFERENCES roulette_accounts(player_id),
+            item_code TEXT NOT NULL
+                REFERENCES shop_items(code),
+            price_paid INTEGER NOT NULL CHECK (price_paid >= 0),
+            purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            UNIQUE (player_id, item_code)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_player_purchases_player
+            ON player_purchases (player_id);
+
+        -- Первый товар магазина: разблокировка ставок в Кото-КНБ
+        INSERT INTO shop_items (
+            code,
+            name,
+            description,
+            category,
+            price,
+            is_active
+        )
+        VALUES (
+            'knb_betting',
+            'Ставки в Кото-КНБ',
+            'Навсегда открывает возможность играть на мяукоины в Кото-КНБ.',
+            'unlock',
+            750,
+            TRUE
+        )
+        ON CONFLICT (code) DO NOTHING;
     `);
     console.log('PostgreSQL schema is ready.');
 }
