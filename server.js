@@ -266,8 +266,7 @@ app.post('/api/players/heartbeat', async (req, res) => {
 // DO NOT DISTURB
 // ========================================
 
-app.post('/api/players/:playerId/do-not-disturb', (req, res) => {
-    const playerId = req.params.playerId;
+app.post('/api/players/:playerId/do-not-disturb', async (req, res) => {
     const { enabled } = req.body || {};
 
     if (typeof enabled !== 'boolean') {
@@ -276,24 +275,34 @@ app.post('/api/players/:playerId/do-not-disturb', (req, res) => {
         });
     }
 
-    const player = players.get(playerId);
+    try {
+        const canonicalId = await resolvePlayerId(req.params.playerId);
+        const player = players.get(canonicalId);
 
-    if (!player) {
-        return res.status(404).json({
-            error: 'Player not found'
+        if (!player) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        player.doNotDisturb = enabled;
+
+        console.log(
+            `Do Not Disturb ${enabled ? 'enabled' : 'disabled'}: ${player.nickname}`
+        );
+
+        return res.json({
+            success: true,
+            doNotDisturb: player.doNotDisturb
+        });
+
+    } catch (error) {
+        console.error('Do Not Disturb update failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    player.doNotDisturb = enabled;
-
-    console.log(
-        `Do Not Disturb ${enabled ? 'enabled' : 'disabled'}: ${player.nickname}`
-    );
-
-    res.json({
-        success: true,
-        doNotDisturb: player.doNotDisturb
-    });
 });
 
 // ========================================
@@ -320,126 +329,145 @@ app.get('/api/players', (req, res) => {
 // INVITATIONS
 // ========================================
 
-app.post('/api/invites', (req, res) => {
+app.post('/api/invites', async (req, res) => {
     cleanup();
 
     const { fromId, toId } = req.body || {};
 
     if (
         typeof fromId !== 'string' ||
-        typeof toId !== 'string' ||
-        fromId === toId
+        typeof toId !== 'string'
     ) {
         return res.status(400).json({
             error: 'Invalid invitation'
         });
     }
 
-    const sender = players.get(fromId);
-    const recipient = players.get(toId);
+    try {
+        const canonicalFromId = await resolvePlayerId(fromId);
+        const canonicalToId = await resolvePlayerId(toId);
 
-    if (!sender || !recipient) {
-        return res.status(404).json({
-            error: 'Player not found or offline'
+        if (canonicalFromId === canonicalToId) {
+            return res.status(400).json({
+                error: 'Invalid invitation'
+            });
+        }
+
+        const sender = players.get(canonicalFromId);
+        const recipient = players.get(canonicalToId);
+
+        if (!sender || !recipient) {
+            return res.status(404).json({
+                error: 'Player not found or offline'
+            });
+        }
+
+        if (recipient.doNotDisturb) {
+            return res.status(403).json({
+                error: 'Player does not accept invitations'
+            });
+        }
+
+        if (
+            getMatchForPlayer(canonicalFromId) ||
+            getMatchForPlayer(canonicalToId)
+        ) {
+            return res.status(409).json({
+                error: 'A player is already in a match'
+            });
+        }
+
+        const existing = Array.from(invitations.values()).find(invite =>
+            invite.fromId === canonicalFromId &&
+            invite.toId === canonicalToId
+        );
+
+        if (existing) {
+            return res.status(409).json({
+                error: 'Invitation already sent'
+            });
+        }
+
+        const invite = {
+            id: crypto.randomUUID(),
+            fromId: canonicalFromId,
+            fromNickname: sender.nickname,
+            toId: canonicalToId,
+            toNickname: recipient.nickname,
+            expiresAt: Date.now() + INVITE_TIMEOUT
+        };
+
+        invitations.set(invite.id, invite);
+
+        console.log(
+            `Invitation: ${sender.nickname} -> ${recipient.nickname}`
+        );
+
+        return res.json({
+            success: true,
+            invitationId: invite.id
+        });
+
+    } catch (error) {
+        console.error('Invitation creation failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    // Проверяем режим «Не беспокоить»
-    if (recipient.doNotDisturb) {
-        return res.status(403).json({
-            error: 'Player does not accept invitations'
-        });
-    }
-
-    // Проверяем, участвуют ли игроки в активном матче
-    if (getMatchForPlayer(fromId) || getMatchForPlayer(toId)) {
-        return res.status(409).json({
-            error: 'A player is already in a match'
-        });
-    }
-
-    // Проверяем повторное приглашение
-    const existing = Array.from(invitations.values()).find(invite =>
-        invite.fromId === fromId &&
-        invite.toId === toId
-    );
-
-    if (existing) {
-        return res.status(409).json({
-            error: 'Invitation already sent'
-        });
-    }
-
-    const invite = {
-        id: crypto.randomUUID(),
-        fromId,
-        fromNickname: sender.nickname,
-        toId,
-        toNickname: recipient.nickname,
-        expiresAt: Date.now() + INVITE_TIMEOUT
-    };
-
-    invitations.set(invite.id, invite);
-
-    console.log(
-        `Invitation: ${sender.nickname} -> ${recipient.nickname}`
-    );
-
-    res.json({
-        success: true,
-        invitationId: invite.id
-    });
 });
 
 // ========================================
 // GET INVITATIONS
 // ========================================
 
-app.get('/api/invites/:playerId', (req, res) => {
+app.get('/api/invites/:playerId', async (req, res) => {
     cleanup();
 
-    const playerId = req.params.playerId;
+    try {
+        const playerId = await resolvePlayerId(req.params.playerId);
 
-    if (!players.has(playerId)) {
-        return res.status(404).json({
-            error: 'Player not found'
+        if (!players.has(playerId)) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        const incoming = Array.from(invitations.values())
+            .filter(invite => invite.toId === playerId)
+            .map(invite => ({
+                id: invite.id,
+                fromId: invite.fromId,
+                fromNickname: invite.fromNickname,
+                expiresAt: invite.expiresAt
+            }));
+
+        return res.json({
+            success: true,
+            invitations: incoming
+        });
+
+    } catch (error) {
+        console.error('Invitation retrieval failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    const incoming = Array.from(invitations.values())
-        .filter(invite => invite.toId === playerId)
-        .map(invite => ({
-            id: invite.id,
-            fromId: invite.fromId,
-            fromNickname: invite.fromNickname,
-            expiresAt: invite.expiresAt
-        }));
-
-    res.json({
-        success: true,
-        invitations: incoming
-    });
 });
 
 // ========================================
 // RESPOND TO INVITATION
 // ========================================
 
-app.post('/api/invites/:inviteId/respond', (req, res) => {
+app.post('/api/invites/:inviteId/respond', async (req, res) => {
     cleanup();
 
     const { playerId, accept } = req.body || {};
-    const invite = invitations.get(req.params.inviteId);
 
-    if (!invite) {
-        return res.status(404).json({
-            error: 'Invitation expired or not found'
-        });
-    }
-
-    if (invite.toId !== playerId) {
-        return res.status(403).json({
-            error: 'This invitation belongs to another player'
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
         });
     }
 
@@ -449,112 +477,146 @@ app.post('/api/invites/:inviteId/respond', (req, res) => {
         });
     }
 
-    if (!players.has(invite.fromId) || !players.has(invite.toId)) {
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+        const invite = invitations.get(req.params.inviteId);
+
+        if (!invite) {
+            return res.status(404).json({
+                error: 'Invitation expired or not found'
+            });
+        }
+
+        if (invite.toId !== canonicalId) {
+            return res.status(403).json({
+                error: 'This invitation belongs to another player'
+            });
+        }
+
+        if (!players.has(invite.fromId) || !players.has(invite.toId)) {
+            invitations.delete(invite.id);
+
+            return res.status(409).json({
+                error: 'A player is offline'
+            });
+        }
+
         invitations.delete(invite.id);
 
-        return res.status(409).json({
-            error: 'A player is offline'
-        });
-    }
+        if (!accept) {
+            console.log(`Invitation rejected: ${invite.toNickname}`);
 
-    invitations.delete(invite.id);
+            return res.json({
+                success: true,
+                status: 'rejected'
+            });
+        }
 
-    if (!accept) {
-        console.log(`Invitation rejected: ${invite.toNickname}`);
+        if (
+            getMatchForPlayer(invite.fromId) ||
+            getMatchForPlayer(invite.toId)
+        ) {
+            return res.status(409).json({
+                error: 'A player is already in a match'
+            });
+        }
+
+        const first = players.get(invite.fromId);
+        const second = players.get(invite.toId);
+
+        const match = {
+            id: crypto.randomUUID(),
+            game: 'rock-paper-scissors',
+            status: 'playing',
+            createdAt: Date.now(),
+            players: [
+                {
+                    id: first.id,
+                    nickname: first.nickname,
+                    move: null
+                },
+                {
+                    id: second.id,
+                    nickname: second.nickname,
+                    move: null
+                }
+            ],
+            winner: null,
+            finishedAt: null
+        };
+
+        matches.set(match.id, match);
+
+        console.log(
+            `Match created: ${first.nickname} vs ${second.nickname}`
+        );
 
         return res.json({
             success: true,
-            status: 'rejected'
+            status: 'accepted',
+            matchId: match.id
+        });
+
+    } catch (error) {
+        console.error('Invitation response failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    if (
-        getMatchForPlayer(invite.fromId) ||
-        getMatchForPlayer(invite.toId)
-    ) {
-        return res.status(409).json({
-            error: 'A player is already in a match'
-        });
-    }
-
-    const first = players.get(invite.fromId);
-    const second = players.get(invite.toId);
-
-    const match = {
-        id: crypto.randomUUID(),
-        game: 'rock-paper-scissors',
-        status: 'playing',
-        createdAt: Date.now(),
-        players: [
-            {
-                id: first.id,
-                nickname: first.nickname,
-                move: null
-            },
-            {
-                id: second.id,
-                nickname: second.nickname,
-                move: null
-            }
-        ],
-        winner: null,
-        finishedAt: null
-    };
-
-    matches.set(match.id, match);
-
-    console.log(
-        `Match created: ${first.nickname} vs ${second.nickname}`
-    );
-
-    res.json({
-        success: true,
-        status: 'accepted',
-        matchId: match.id
-    });
 });
 
 // ========================================
 // GET PLAYER MATCH
 // ========================================
 
-app.get('/api/matches/player/:playerId', (req, res) => {
+app.get('/api/matches/player/:playerId', async (req, res) => {
     cleanup();
 
-    const playerId = req.params.playerId;
-    const match = getMatchForPlayer(playerId);
+    try {
+        const playerId = await resolvePlayerId(req.params.playerId);
+        const match = getMatchForPlayer(playerId);
 
-    if (!match) {
+        if (!match) {
+            return res.json({
+                success: true,
+                match: null
+            });
+        }
+
         return res.json({
             success: true,
-            match: null
+            match: {
+                id: match.id,
+                game: match.game,
+                status: match.status,
+                players: match.players.map(player => ({
+                    id: player.id,
+                    nickname: player.nickname,
+                    hasMoved: player.move !== null
+                })),
+                winner: match.winner
+            }
+        });
+
+    } catch (error) {
+        console.error('Player match lookup failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    res.json({
-        success: true,
-        match: {
-            id: match.id,
-            game: match.game,
-            status: match.status,
-            players: match.players.map(player => ({
-                id: player.id,
-                nickname: player.nickname,
-                hasMoved: player.move !== null
-            })),
-            winner: match.winner
-        }
-    });
 });
 
 // ========================================
 // SUBMIT MOVE
 // ========================================
 
-app.post('/api/matches/:matchId/move', (req, res) => {
+app.post('/api/matches/:matchId/move', async (req, res) => {
     cleanup();
 
     const { playerId, move } = req.body || {};
+
     const match = matches.get(req.params.matchId);
 
     if (!match || match.status !== 'playing') {
@@ -569,53 +631,69 @@ app.post('/api/matches/:matchId/move', (req, res) => {
         });
     }
 
-    const player = match.players.find(p => p.id === playerId);
-
-    if (!player) {
-        return res.status(403).json({
-            error: 'You are not a participant'
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
         });
     }
 
-    if (player.move !== null) {
-        return res.status(409).json({
-            error: 'You have already moved'
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+        const player = match.players.find(p => p.id === canonicalId);
+
+        if (!player) {
+            return res.status(403).json({
+                error: 'You are not a participant'
+            });
+        }
+
+        if (player.move !== null) {
+            return res.status(409).json({
+                error: 'You have already moved'
+            });
+        }
+
+        player.move = move;
+
+        console.log(`Move submitted in match ${match.id}`);
+
+        const bothMoved = match.players.every(p => p.move !== null);
+
+        if (bothMoved) {
+            const result = getWinner(
+                match.players[0].move,
+                match.players[1].move
+            );
+
+            match.winner = result === 'draw'
+                ? 'draw'
+                : match.players[result === 'first' ? 0 : 1].id;
+
+            match.status = 'finished';
+            match.finishedAt = Date.now();
+
+            console.log(`Match finished: ${match.winner}`);
+        }
+
+        return res.json({
+            success: true,
+            waitingForOpponent: !bothMoved
+        });
+
+    } catch (error) {
+        console.error('Move submission failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
         });
     }
-
-    player.move = move;
-
-    console.log(`Move submitted in match ${match.id}`);
-
-    const bothMoved = match.players.every(p => p.move !== null);
-
-    if (bothMoved) {
-        const result = getWinner(
-            match.players[0].move,
-            match.players[1].move
-        );
-
-        match.winner = result === 'draw'
-            ? 'draw'
-            : match.players[result === 'first' ? 0 : 1].id;
-
-        match.status = 'finished';
-        match.finishedAt = Date.now();
-
-        console.log(`Match finished: ${match.winner}`);
-    }
-
-    res.json({
-        success: true,
-        waitingForOpponent: !bothMoved
-    });
 });
 
 // ========================================
 // GET MATCH RESULT
 // ========================================
 
-app.get('/api/matches/:matchId', (req, res) => {
+app.get('/api/matches/:matchId', async (req, res) => {
     cleanup();
 
     const { playerId } = req.query;
@@ -627,30 +705,46 @@ app.get('/api/matches/:matchId', (req, res) => {
         });
     }
 
-    const currentPlayer = match.players.find(p => p.id === playerId);
-
-    if (!currentPlayer) {
-        return res.status(403).json({
-            error: 'You are not a participant'
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
         });
     }
 
-    const bothMoved = match.players.every(p => p.move !== null);
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+        const currentPlayer = match.players.find(p => p.id === canonicalId);
 
-    res.json({
-        success: true,
-        match: {
-            id: match.id,
-            status: match.status,
-            players: match.players.map(player => ({
-                id: player.id,
-                nickname: player.nickname,
-                move: bothMoved ? player.move : null,
-                hasMoved: player.move !== null
-            })),
-            winner: bothMoved ? match.winner : null
+        if (!currentPlayer) {
+            return res.status(403).json({
+                error: 'You are not a participant'
+            });
         }
-    });
+
+        const bothMoved = match.players.every(p => p.move !== null);
+
+        return res.json({
+            success: true,
+            match: {
+                id: match.id,
+                status: match.status,
+                players: match.players.map(player => ({
+                    id: player.id,
+                    nickname: player.nickname,
+                    move: bothMoved ? player.move : null,
+                    hasMoved: player.move !== null
+                })),
+                winner: bothMoved ? match.winner : null
+            }
+        });
+
+    } catch (error) {
+        console.error('Match result lookup failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+    }
 });
 
 
@@ -661,87 +755,206 @@ app.get('/api/matches/:matchId', (req, res) => {
 // Состояние одиночной шахты и время следующей попытки
 app.get('/api/roulette/status/:playerId', async (req, res) => {
     try {
-        const playerId = req.params.playerId;
+        const playerId = await resolvePlayerId(req.params.playerId);
+
         const result = await pool.query(
             `SELECT a.balance, COALESCE(c.next_at, 0) AS next_at
              FROM roulette_accounts a
-             LEFT JOIN roulette_cooldowns c ON c.player_id = a.player_id
-             WHERE a.player_id = $1`, [playerId]
+             LEFT JOIN roulette_cooldowns c
+                 ON c.player_id = a.player_id
+             WHERE a.player_id = $1`,
+            [playerId]
         );
-        if (!result.rowCount) return res.status(404).json({ error: 'Player not found' });
+
+        if (!result.rowCount) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
         const balance = Number(result.rows[0].balance);
         const nextAt = Number(result.rows[0].next_at);
-        res.json({ success: true, balance, nextAt, cooldownMs: Math.max(0, nextAt - Date.now()) });
+
+        return res.json({
+            success: true,
+            balance,
+            nextAt,
+            cooldownMs: Math.max(0, nextAt - Date.now())
+        });
+
     } catch (error) {
         console.error('Roulette status failed:', error);
-        res.status(503).json({ error: 'Database temporarily unavailable' });
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
 });
 
 app.post('/api/roulette/solo', async (req, res) => {
     cleanup();
+
     const { playerId } = req.body || {};
-    if (typeof playerId !== 'string' || !players.has(playerId)) {
-        return res.status(404).json({ error: 'Player not found or offline' });
+
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
     }
 
     let client;
+
     try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        if (!players.has(canonicalId)) {
+            return res.status(404).json({
+                error: 'Player not found or offline'
+            });
+        }
+
         client = await pool.connect();
         await client.query('BEGIN');
-        const account = await client.query('SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE', [playerId]);
-        if (!account.rowCount) throw new Error('PLAYER_NOT_FOUND');
-        const cooldown = await client.query('SELECT next_at FROM roulette_cooldowns WHERE player_id = $1 FOR UPDATE', [playerId]);
+
+        const account = await client.query(
+            'SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE',
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        const cooldown = await client.query(
+            'SELECT next_at FROM roulette_cooldowns WHERE player_id = $1 FOR UPDATE',
+            [canonicalId]
+        );
+
         const now = Date.now();
-        const nextAt = cooldown.rowCount ? Number(cooldown.rows[0].next_at) : 0;
+        const nextAt = cooldown.rowCount
+            ? Number(cooldown.rows[0].next_at)
+            : 0;
+
         if (now < nextAt) {
             await client.query('ROLLBACK');
-            return res.status(429).json({ error: 'Попытка ещё восстанавливается', cooldownMs: nextAt - now, nextAt });
+
+            return res.status(429).json({
+                error: 'Попытка ещё восстанавливается',
+                cooldownMs: nextAt - now,
+                nextAt
+            });
         }
 
         const reels = spinRoulette();
         const score = getRouletteScore(reels);
         const newBalance = Number(account.rows[0].balance) + score;
-        await client.query('UPDATE roulette_accounts SET balance = $2, updated_at = NOW() WHERE player_id = $1', [playerId, newBalance]);
+
         await client.query(
-            `INSERT INTO roulette_transactions (player_id, type, amount, details)
+            `UPDATE roulette_accounts
+             SET balance = $2, updated_at = NOW()
+             WHERE player_id = $1`,
+            [canonicalId, newBalance]
+        );
+
+        await client.query(
+            `INSERT INTO roulette_transactions
+                (player_id, type, amount, details)
              VALUES ($1, 'solo_reward', $2, $3::jsonb)`,
-            [playerId, score, JSON.stringify({ reels, multiplier: getRouletteMultiplier(reels) })]
+            [
+                canonicalId,
+                score,
+                JSON.stringify({
+                    reels,
+                    multiplier: getRouletteMultiplier(reels)
+                })
+            ]
         );
+
         await client.query(
-        `INSERT INTO roulette_spins
-            (player_id, nickname, mode, score, jackpot, reels)
-         VALUES ($1, $2, 'solo', $3, $4, $5::jsonb)`,
-        [
-            playerId,
-            players.get(playerId).nickname,
-            score,
-            getRouletteJackpot(reels),
-            JSON.stringify(reels)
-        ]
+            `INSERT INTO roulette_spins
+                (player_id, nickname, mode, score, jackpot, reels)
+             VALUES ($1, $2, 'solo', $3, $4, $5::jsonb)`,
+            [
+                canonicalId,
+                players.get(canonicalId).nickname,
+                score,
+                getRouletteJackpot(reels),
+                JSON.stringify(reels)
+            ]
         );
+
         const newNextAt = now + ROULETTE_COOLDOWN;
+
         await client.query(
-            `INSERT INTO roulette_cooldowns (player_id, next_at) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET next_at = EXCLUDED.next_at`, [playerId, newNextAt]
+            `INSERT INTO roulette_cooldowns (player_id, next_at)
+             VALUES ($1, $2)
+             ON CONFLICT (player_id)
+             DO UPDATE SET next_at = EXCLUDED.next_at`,
+            [canonicalId, newNextAt]
         );
+
         await client.query('COMMIT');
-        res.json({ success: true, mode: 'solo', reels, score, multiplier: getRouletteMultiplier(reels), jackpot: getRouletteJackpot(reels), balance: newBalance, nextAt: newNextAt, cooldownMs: ROULETTE_COOLDOWN });
+
+        return res.json({
+            success: true,
+            mode: 'solo',
+            reels,
+            score,
+            multiplier: getRouletteMultiplier(reels),
+            jackpot: getRouletteJackpot(reels),
+            balance: newBalance,
+            nextAt: newNextAt,
+            cooldownMs: ROULETTE_COOLDOWN
+        });
+
     } catch (error) {
-        if (client) await client.query('ROLLBACK').catch(() => {});
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
         console.error('Solo roulette failed:', error);
-        res.status(error.message === 'PLAYER_NOT_FOUND' ? 404 : 503).json({ error: error.message === 'PLAYER_NOT_FOUND' ? 'Player not found' : 'Database temporarily unavailable' });
-    } finally { if (client) client.release(); }
+
+        return res.status(
+            error.message === 'PLAYER_NOT_FOUND' ? 404 : 503
+        ).json({
+            error: error.message === 'PLAYER_NOT_FOUND'
+                ? 'Player not found'
+                : 'Database temporarily unavailable'
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 });
 
 app.get('/api/roulette/balance/:playerId', async (req, res) => {
     try {
-        const result = await pool.query('SELECT balance FROM roulette_accounts WHERE player_id = $1', [req.params.playerId]);
-        if (!result.rowCount) return res.status(404).json({ error: 'Player not found' });
-        res.json({ success: true, balance: Number(result.rows[0].balance) });
+        const playerId = await resolvePlayerId(req.params.playerId);
+
+        const result = await pool.query(
+            'SELECT balance FROM roulette_accounts WHERE player_id = $1',
+            [playerId]
+        );
+
+        if (!result.rowCount) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        return res.json({
+            success: true,
+            balance: Number(result.rows[0].balance)
+        });
+
     } catch (error) {
         console.error('Balance read failed:', error);
-        res.status(503).json({ error: 'Database temporarily unavailable' });
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
 });
 
@@ -751,7 +964,7 @@ app.get('/api/roulette/balance/:playerId', async (req, res) => {
 
 app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
     try {
-        const playerId = req.params.playerId;
+        const playerId = await resolvePlayerId(req.params.playerId);
 
         // Баланс, заработанные очки и статистика джекпотов
         const leaderboardResult = await pool.query(`
@@ -1047,304 +1260,777 @@ app.post('/api/roulette/invites', async (req, res) => {
     cleanup();
 
     const { fromId, toId } = req.body || {};
+
     if (
         typeof fromId !== 'string' ||
-        typeof toId !== 'string' ||
-        fromId === toId
+        typeof toId !== 'string'
     ) {
-        return res.status(400).json({ error: 'Invalid invitation' });
-    }
-
-    const sender = players.get(fromId);
-    const recipient = players.get(toId);
-
-    if (!sender || !recipient) {
-        return res.status(404).json({ error: 'Player not found or offline' });
-    }
-
-    if (recipient.doNotDisturb) {
-        return res.status(403).json({ error: 'Player does not accept invitations' });
+        return res.status(400).json({
+            error: 'Invalid invitation'
+        });
     }
 
     try {
+        const canonicalFromId = await resolvePlayerId(fromId);
+        const canonicalToId = await resolvePlayerId(toId);
+
+        if (canonicalFromId === canonicalToId) {
+            return res.status(400).json({
+                error: 'Invalid invitation'
+            });
+        }
+
+        const sender = players.get(canonicalFromId);
+        const recipient = players.get(canonicalToId);
+
+        if (!sender || !recipient) {
+            return res.status(404).json({
+                error: 'Player not found or offline'
+            });
+        }
+
+        if (recipient.doNotDisturb) {
+            return res.status(403).json({
+                error: 'Player does not accept invitations'
+            });
+        }
+
         const active = await pool.query(
-            `SELECT id FROM roulette_matches WHERE status IN ('negotiating', 'playing')
-             AND (players @> $1::jsonb OR players @> $2::jsonb) LIMIT 1`,
-            [JSON.stringify([{ id: fromId }]), JSON.stringify([{ id: toId }])]
+            `SELECT id
+             FROM roulette_matches
+             WHERE status IN ('negotiating', 'playing')
+               AND (
+                   players @> $1::jsonb
+                   OR players @> $2::jsonb
+               )
+             LIMIT 1`,
+            [
+                JSON.stringify([{ id: canonicalFromId }]),
+                JSON.stringify([{ id: canonicalToId }])
+            ]
         );
-        if (active.rowCount) return res.status(409).json({ error: 'A player is already in a roulette round' });
+
+        if (active.rowCount) {
+            return res.status(409).json({
+                error: 'A player is already in a roulette round'
+            });
+        }
+
+        const alreadyInvited = Array.from(
+            rouletteInvitations.values()
+        ).some(invite =>
+            invite.fromId === canonicalFromId &&
+            invite.toId === canonicalToId
+        );
+
+        if (alreadyInvited) {
+            return res.status(409).json({
+                error: 'Invitation already sent'
+            });
+        }
+
+        const invite = {
+            id: crypto.randomUUID(),
+            fromId: canonicalFromId,
+            fromNickname: sender.nickname,
+            toId: canonicalToId,
+            toNickname: recipient.nickname,
+            expiresAt: Date.now() + ROULETTE_INVITE_TIMEOUT
+        };
+
+        rouletteInvitations.set(invite.id, invite);
+
+        return res.json({
+            success: true,
+            invitationId: invite.id
+        });
+
     } catch (error) {
-        console.error('Active match check failed:', error);
-        return res.status(503).json({ error: 'Database temporarily unavailable' });
+        console.error('Create roulette invitation failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
-
-    const alreadyInvited = Array.from(rouletteInvitations.values()).some(invite =>
-        invite.fromId === fromId && invite.toId === toId
-    );
-
-    if (alreadyInvited) {
-        return res.status(409).json({ error: 'Invitation already sent' });
-    }
-
-    const invite = {
-        id: crypto.randomUUID(),
-        fromId,
-        fromNickname: sender.nickname,
-        toId,
-        toNickname: recipient.nickname,
-        expiresAt: Date.now() + ROULETTE_INVITE_TIMEOUT
-    };
-
-    rouletteInvitations.set(invite.id, invite);
-    res.json({ success: true, invitationId: invite.id });
 });
 
 // Получить входящие приглашения в рулетку
-app.get('/api/roulette/invites/:playerId', (req, res) => {
+app.get('/api/roulette/invites/:playerId', async (req, res) => {
     cleanup();
 
-    const playerId = req.params.playerId;
-    if (!players.has(playerId)) {
-        return res.status(404).json({ error: 'Player not found' });
+    try {
+        const playerId = await resolvePlayerId(req.params.playerId);
+
+        if (!players.has(playerId)) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        const incoming = Array.from(rouletteInvitations.values())
+            .filter(invite => invite.toId === playerId)
+            .map(invite => ({
+                id: invite.id,
+                fromId: invite.fromId,
+                fromNickname: invite.fromNickname,
+                expiresAt: invite.expiresAt
+            }));
+
+        return res.json({
+            success: true,
+            invitations: incoming
+        });
+
+    } catch (error) {
+        console.error('Roulette invitation retrieval failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
-
-    const incoming = Array.from(rouletteInvitations.values())
-        .filter(invite => invite.toId === playerId)
-        .map(invite => ({
-            id: invite.id,
-            fromId: invite.fromId,
-            fromNickname: invite.fromNickname,
-            expiresAt: invite.expiresAt
-        }));
-
-    res.json({ success: true, invitations: incoming });
 });
 
 // Принять или отклонить приглашение
 app.post('/api/roulette/invites/:inviteId/respond', async (req, res) => {
     cleanup();
+
     const { playerId, accept } = req.body || {};
     const invite = rouletteInvitations.get(req.params.inviteId);
-    if (!invite) return res.status(404).json({ error: 'Invitation expired or not found' });
-    if (invite.toId !== playerId) return res.status(403).json({ error: 'This invitation belongs to another player' });
-    if (typeof accept !== 'boolean') return res.status(400).json({ error: 'Invalid response' });
-    rouletteInvitations.delete(invite.id);
-    if (!accept) return res.json({ success: true, status: 'rejected' });
 
-    const first = players.get(invite.fromId);
-    const second = players.get(invite.toId);
-    if (!first || !second) return res.status(409).json({ error: 'A player is offline' });
-    const matchId = crypto.randomUUID();
-    const createdAt = Date.now();
-    const matchPlayers = [
-        { id: first.id, nickname: first.nickname, offer: null, reels: null, score: null },
-        { id: second.id, nickname: second.nickname, offer: null, reels: null, score: null }
-    ];
+    if (!invite) {
+        return res.status(404).json({
+            error: 'Invitation expired or not found'
+        });
+    }
+
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
+    }
+
+    if (typeof accept !== 'boolean') {
+        return res.status(400).json({
+            error: 'Invalid response'
+        });
+    }
+
     let client;
+
     try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        if (invite.toId !== canonicalId) {
+            return res.status(403).json({
+                error: 'This invitation belongs to another player'
+            });
+        }
+
+        rouletteInvitations.delete(invite.id);
+
+        if (!accept) {
+            return res.json({
+                success: true,
+                status: 'rejected'
+            });
+        }
+
+        const first = players.get(invite.fromId);
+        const second = players.get(invite.toId);
+
+        if (!first || !second) {
+            return res.status(409).json({
+                error: 'A player is offline'
+            });
+        }
+
+        const matchId = crypto.randomUUID();
+        const createdAt = Date.now();
+
+        const matchPlayers = [
+            {
+                id: first.id,
+                nickname: first.nickname,
+                offer: null,
+                reels: null,
+                score: null
+            },
+            {
+                id: second.id,
+                nickname: second.nickname,
+                offer: null,
+                reels: null,
+                score: null
+            }
+        ];
+
         client = await pool.connect();
         await client.query('BEGIN');
+
         await lockRoulettePlayers(client, [first.id, second.id]);
+
         const active = await client.query(
-            `SELECT id FROM roulette_matches
+            `SELECT id
+             FROM roulette_matches
              WHERE status IN ('negotiating', 'playing')
-               AND (players @> $1::jsonb OR players @> $2::jsonb)
+               AND (
+                   players @> $1::jsonb
+                   OR players @> $2::jsonb
+               )
              LIMIT 1 FOR UPDATE`,
-            [JSON.stringify([{ id: first.id }]), JSON.stringify([{ id: second.id }])]
+            [
+                JSON.stringify([{ id: first.id }]),
+                JSON.stringify([{ id: second.id }])
+            ]
         );
-        if (active.rowCount) throw new Error('PLAYER_ALREADY_IN_MATCH');
+
+        if (active.rowCount) {
+            throw new Error('PLAYER_ALREADY_IN_MATCH');
+        }
+
         await client.query(
-            `INSERT INTO roulette_matches (id, status, players, created_at)
+            `INSERT INTO roulette_matches
+                (id, status, players, created_at)
              VALUES ($1, 'negotiating', $2::jsonb, $3)`,
             [matchId, JSON.stringify(matchPlayers), createdAt]
         );
+
         await client.query('COMMIT');
-        res.json({ success: true, status: 'accepted', matchId });
+
+        return res.json({
+            success: true,
+            status: 'accepted',
+            matchId
+        });
+
     } catch (error) {
-        if (client) await client.query('ROLLBACK').catch(() => {});
-        if (error.message === 'PLAYER_ALREADY_IN_MATCH') {
-            return res.status(409).json({ error: 'A player is already in a roulette round' });
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
         }
+
+        if (error.message === 'PLAYER_ALREADY_IN_MATCH') {
+            return res.status(409).json({
+                error: 'A player is already in a roulette round'
+            });
+        }
+
         console.error('Create roulette match failed:', error);
-        res.status(503).json({ error: 'Database temporarily unavailable' });
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+
     } finally {
-        if (client) client.release();
+        if (client) {
+            client.release();
+        }
     }
 });
 
 // Игрок изменяет только собственное предложение. Списание происходит лишь при совпадении ставок.
 app.post('/api/roulette/matches/:matchId/offer', async (req, res) => {
     const { playerId, amount } = req.body || {};
+
     if (typeof playerId !== 'string' || !playerId.trim()) {
-        return res.status(400).json({ error: 'Invalid playerId' });
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
     }
+
     const stake = Number(amount);
-    if (!Number.isSafeInteger(stake) || stake < 50) return res.status(400).json({ error: 'Минимальная ставка — 50 очков' });
+
+    if (!Number.isSafeInteger(stake) || stake < 50) {
+        return res.status(400).json({
+            error: 'Минимальная ставка — 50 очков'
+        });
+    }
+
     let client;
+
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-        const row = await client.query('SELECT * FROM roulette_matches WHERE id = $1 FOR UPDATE', [req.params.matchId]);
-        if (!row.rowCount) throw new Error('MATCH_NOT_FOUND');
+
+        const canonicalId = await resolvePlayerId(playerId, client);
+
+        const row = await client.query(
+            'SELECT * FROM roulette_matches WHERE id = $1 FOR UPDATE',
+            [req.params.matchId]
+        );
+
+        if (!row.rowCount) {
+            throw new Error('MATCH_NOT_FOUND');
+        }
+
         const match = row.rows[0];
-        if (match.status !== 'negotiating') throw new Error('MATCH_NOT_NEGOTIATING');
+
+        if (match.status !== 'negotiating') {
+            throw new Error('MATCH_NOT_NEGOTIATING');
+        }
+
         const playersData = match.players;
-        const me = playersData.find(p => p.id === playerId);
-        if (!me) throw new Error('NOT_PARTICIPANT');
-        const account = await client.query('SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE', [playerId]);
-        if (!account.rowCount || Number(account.rows[0].balance) < stake) throw new Error('INSUFFICIENT_BALANCE');
+        const me = playersData.find(p => p.id === canonicalId);
+
+        if (!me) {
+            throw new Error('NOT_PARTICIPANT');
+        }
+
+        const account = await client.query(
+            'SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE',
+            [canonicalId]
+        );
+
+        if (
+            !account.rowCount ||
+            Number(account.rows[0].balance) < stake
+        ) {
+            throw new Error('INSUFFICIENT_BALANCE');
+        }
+
         me.offer = stake;
-        const other = playersData.find(p => p.id !== playerId);
+
+        const other = playersData.find(p => p.id !== canonicalId);
+
         let status = 'negotiating';
         let totalPot = null;
+
         if (other && other.offer === stake) {
             const ids = playersData.map(p => p.id).sort();
-            const balances = await client.query('SELECT player_id, balance FROM roulette_accounts WHERE player_id = ANY($1::text[]) ORDER BY player_id FOR UPDATE', [ids]);
-            if (balances.rowCount !== 2 || balances.rows.some(r => Number(r.balance) < stake)) throw new Error('INSUFFICIENT_BALANCE');
+
+            const balances = await client.query(
+                `SELECT player_id, balance
+                 FROM roulette_accounts
+                 WHERE player_id = ANY($1::text[])
+                 ORDER BY player_id
+                 FOR UPDATE`,
+                [ids]
+            );
+
+            if (
+                balances.rowCount !== 2 ||
+                balances.rows.some(r => Number(r.balance) < stake)
+            ) {
+                throw new Error('INSUFFICIENT_BALANCE');
+            }
+
             for (const p of playersData) {
                 const debit = await client.query(
-                    'UPDATE roulette_accounts SET balance = balance - $2, updated_at = NOW() WHERE player_id = $1 AND balance >= $2',
+                    `UPDATE roulette_accounts
+                     SET balance = balance - $2,
+                         updated_at = NOW()
+                     WHERE player_id = $1
+                       AND balance >= $2`,
                     [p.id, stake]
                 );
-                if (debit.rowCount !== 1) throw new Error('INSUFFICIENT_BALANCE');
+
+                if (debit.rowCount !== 1) {
+                    throw new Error('INSUFFICIENT_BALANCE');
+                }
+
                 await client.query(
-                    `INSERT INTO roulette_transactions (player_id, match_id, type, amount)
+                    `INSERT INTO roulette_transactions
+                        (player_id, match_id, type, amount)
                      VALUES ($1, $2, 'stake_reserved', $3)`,
                     [p.id, req.params.matchId, -stake]
                 );
             }
-            match.status = 'playing'; match.stake = stake; match.pot = stake * 2; match.round = 1;
-            status = 'playing'; totalPot = match.pot;
+
+            match.status = 'playing';
+            match.stake = stake;
+            match.pot = stake * 2;
+            match.round = 1;
+
+            status = 'playing';
+            totalPot = match.pot;
         }
-        await client.query('UPDATE roulette_matches SET status = $2, players = $3::jsonb, stake = $4, pot = $5, round_number = $6, updated_at = NOW() WHERE id = $1', [req.params.matchId, match.status || status, JSON.stringify(playersData), match.stake, match.pot, match.round || 0]);
+
+        await client.query(
+            `UPDATE roulette_matches
+             SET status = $2,
+                 players = $3::jsonb,
+                 stake = $4,
+                 pot = $5,
+                 round_number = $6,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [
+                req.params.matchId,
+                match.status || status,
+                JSON.stringify(playersData),
+                match.stake,
+                match.pot,
+                match.round || 0
+            ]
+        );
+
         await client.query('COMMIT');
-        res.json({ success: true, status, players: playersData, stake: match.stake, pot: totalPot, balance: Number(account.rows[0].balance) - (status === 'playing' ? stake : 0) });
+
+        return res.json({
+            success: true,
+            status,
+            players: playersData,
+            stake: match.stake,
+            pot: totalPot,
+            balance: Number(account.rows[0].balance) -
+                (status === 'playing' ? stake : 0)
+        });
+
     } catch (error) {
-        if (client) await client.query('ROLLBACK').catch(() => {});
-        const map = { MATCH_NOT_FOUND: [404, 'Match not found'], MATCH_NOT_NEGOTIATING: [409, 'Переговоры уже завершены'], NOT_PARTICIPANT: [403, 'You are not a participant'], INSUFFICIENT_BALANCE: [409, 'Недостаточно очков для этой ставки'] };
-        const [code, message] = map[error.message] || [503, 'Database temporarily unavailable'];
-        res.status(code).json({ error: message });
-    } finally { if (client) client.release(); }
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const map = {
+            MATCH_NOT_FOUND: [404, 'Match not found'],
+            MATCH_NOT_NEGOTIATING: [409, 'Переговоры уже завершены'],
+            NOT_PARTICIPANT: [403, 'You are not a participant'],
+            INSUFFICIENT_BALANCE: [409, 'Недостаточно очков для этой ставки']
+        };
+
+        const [code, message] = map[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Roulette offer failed:', error);
+
+        return res.status(code).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 });
 
 app.post('/api/roulette/matches/:matchId/decline', async (req, res) => {
     const { playerId } = req.body || {};
+
     if (typeof playerId !== 'string' || !playerId.trim()) {
-        return res.status(400).json({ error: 'Invalid playerId' });
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
     }
+
     try {
+        const canonicalId = await resolvePlayerId(playerId);
+
         const result = await pool.query(
             `UPDATE roulette_matches
-             SET status = 'cancelled', finished_at = NOW(), updated_at = NOW()
-             WHERE id = $1 AND status = 'negotiating'
+             SET status = 'cancelled',
+                 finished_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'negotiating'
                AND EXISTS (
-                   SELECT 1 FROM jsonb_array_elements(players) AS participant
+                   SELECT 1
+                   FROM jsonb_array_elements(players) AS participant
                    WHERE participant->>'id' = $2
                )
              RETURNING id`,
-            [req.params.matchId, playerId]
+            [req.params.matchId, canonicalId]
         );
-        if (!result.rowCount) return res.status(409).json({ error: 'Не удалось отменить переговоры' });
-        res.json({ success: true, status: 'cancelled' });
+
+        if (!result.rowCount) {
+            return res.status(409).json({
+                error: 'Не удалось отменить переговоры'
+            });
+        }
+
+        return res.json({
+            success: true,
+            status: 'cancelled'
+        });
+
     } catch (error) {
         console.error('Decline roulette match failed:', error);
-        res.status(503).json({ error: 'Database temporarily unavailable' });
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
     }
 });
 
 // Получить активную совместную игру
 app.get('/api/roulette/matches/player/:playerId', async (req, res) => {
     try {
+        const playerId = await resolvePlayerId(req.params.playerId);
+
         const result = await pool.query(
-            `SELECT * FROM roulette_matches WHERE players @> $1::jsonb
-             AND status IN ('negotiating', 'playing', 'finished', 'cancelled', 'expired')
-             ORDER BY created_at DESC LIMIT 1`,
-            [JSON.stringify([{ id: req.params.playerId }])]
+            `SELECT *
+             FROM roulette_matches
+             WHERE players @> $1::jsonb
+               AND status IN (
+                   'negotiating',
+                   'playing',
+                   'finished',
+                   'cancelled',
+                   'expired'
+               )
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [JSON.stringify([{ id: playerId }])]
         );
-        if (!result.rowCount) return res.json({ success: true, match: null });
+
+        if (!result.rowCount) {
+            return res.json({
+                success: true,
+                match: null
+            });
+        }
+
         const row = result.rows[0];
-        res.json({ success: true, match: {
-            id: row.id, status: row.status, stake: row.stake, pot: row.pot,
-            round: row.round_number, winner: row.winner, lastRound: row.last_round,
-            players: row.players.map(p => ({ ...p, hasSpun: !!p.reels }))
-        }});
-    } catch (error) { console.error('Match read failed:', error); res.status(503).json({ error: 'Database temporarily unavailable' }); }
+
+        return res.json({
+            success: true,
+            match: {
+                id: row.id,
+                status: row.status,
+                stake: row.stake,
+                pot: row.pot,
+                round: row.round_number,
+                winner: row.winner,
+                lastRound: row.last_round,
+                players: row.players.map(p => ({
+                    ...p,
+                    hasSpun: !!p.reels
+                }))
+            }
+        });
+
+    } catch (error) {
+        console.error('Match read failed:', error);
+
+        return res.status(503).json({
+            error: 'Database temporarily unavailable'
+        });
+    }
 });
 
 app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
     const { playerId } = req.body || {};
+
+    if (typeof playerId !== 'string' || !playerId.trim()) {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
+    }
+
     let client;
+
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-        const row = await client.query('SELECT * FROM roulette_matches WHERE id = $1 FOR UPDATE', [req.params.matchId]);
-        if (!row.rowCount) throw new Error('MATCH_NOT_FOUND');
+
+        const canonicalId = await resolvePlayerId(playerId, client);
+
+        const row = await client.query(
+            'SELECT * FROM roulette_matches WHERE id = $1 FOR UPDATE',
+            [req.params.matchId]
+        );
+
+        if (!row.rowCount) {
+            throw new Error('MATCH_NOT_FOUND');
+        }
+
         const match = row.rows[0];
-        if (match.status !== 'playing') throw new Error('MATCH_NOT_PLAYING');
+
+        if (match.status !== 'playing') {
+            throw new Error('MATCH_NOT_PLAYING');
+        }
+
         const playersData = match.players;
-        const player = playersData.find(p => p.id === playerId);
-        if (!player) throw new Error('NOT_PARTICIPANT');
-        if (player.reels) throw new Error('ALREADY_SPUN');
+        const player = playersData.find(p => p.id === canonicalId);
+
+        if (!player) {
+            throw new Error('NOT_PARTICIPANT');
+        }
+
+        if (player.reels) {
+            throw new Error('ALREADY_SPUN');
+        }
+
         player.reels = spinRoulette();
         player.score = getRouletteScore(player.reels);
+
         await client.query(
-        `INSERT INTO roulette_spins
-            (player_id, nickname, mode, match_id, round_number, score, jackpot, reels)
-         VALUES ($1, $2, 'coop', $3, $4, $5, $6, $7::jsonb)`,
-        [
-            player.id,
-            player.nickname,
-            req.params.matchId,
-            match.round_number,
-            player.score,
-            getRouletteJackpot(player.reels),
-            JSON.stringify(player.reels)
-        ]
+            `INSERT INTO roulette_spins
+                (player_id, nickname, mode, match_id, round_number, score, jackpot, reels)
+             VALUES ($1, $2, 'coop', $3, $4, $5, $6, $7::jsonb)`,
+            [
+                player.id,
+                player.nickname,
+                req.params.matchId,
+                match.round_number,
+                player.score,
+                getRouletteJackpot(player.reels),
+                JSON.stringify(player.reels)
+            ]
         );
+
         const bothSpun = playersData.every(p => p.reels);
         let winner = null;
         let lastRound = match.last_round;
         let nextRound = false;
+
         if (bothSpun) {
             const [a, b] = playersData;
-            winner = a.score === b.score ? 'draw' : (a.score > b.score ? a.id : b.id);
-            lastRound = { round: match.round_number, players: playersData.map(p => ({ id:p.id, nickname:p.nickname, reels:p.reels, score:p.score })), winner };
+
+            winner = a.score === b.score
+                ? 'draw'
+                : (a.score > b.score ? a.id : b.id);
+
+            lastRound = {
+                round: match.round_number,
+                players: playersData.map(p => ({
+                    id: p.id,
+                    nickname: p.nickname,
+                    reels: p.reels,
+                    score: p.score
+                })),
+                winner
+            };
+
             if (winner === 'draw') {
                 nextRound = true;
-                for (const p of playersData) { p.reels = null; p.score = null; }
-                await client.query('UPDATE roulette_matches SET players=$2::jsonb, last_round=$3::jsonb, round_number=round_number+1, updated_at=NOW() WHERE id=$1', [req.params.matchId, JSON.stringify(playersData), JSON.stringify(lastRound)]);
+
+                for (const p of playersData) {
+                    p.reels = null;
+                    p.score = null;
+                }
+
+                await client.query(
+                    `UPDATE roulette_matches
+                     SET players = $2::jsonb,
+                         last_round = $3::jsonb,
+                         round_number = round_number + 1,
+                         updated_at = NOW()
+                     WHERE id = $1`,
+                    [
+                        req.params.matchId,
+                        JSON.stringify(playersData),
+                        JSON.stringify(lastRound)
+                    ]
+                );
+
             } else {
                 const payout = Number(match.pot);
-                const winnerAccount = await client.query('SELECT balance FROM roulette_accounts WHERE player_id=$1 FOR UPDATE', [winner]);
-                if (!winnerAccount.rowCount) throw new Error('WINNER_ACCOUNT_MISSING');
-                const payoutLog = await client.query("INSERT INTO roulette_transactions (player_id, match_id, type, amount) VALUES ($1,$2,'match_payout',$3) ON CONFLICT DO NOTHING RETURNING id", [winner, req.params.matchId, payout]);
-                if (payoutLog.rowCount !== 1) throw new Error('PAYOUT_ALREADY_RECORDED');
-                await client.query('UPDATE roulette_accounts SET balance=balance+$2, updated_at=NOW() WHERE player_id=$1', [winner, payout]);
-                await client.query("UPDATE roulette_matches SET status='finished', players=$2::jsonb, winner=$3, last_round=$4::jsonb, finished_at=NOW(), updated_at=NOW() WHERE id=$1", [req.params.matchId, JSON.stringify(playersData), winner, JSON.stringify(lastRound)]);
+
+                const winnerAccount = await client.query(
+                    'SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE',
+                    [winner]
+                );
+
+                if (!winnerAccount.rowCount) {
+                    throw new Error('WINNER_ACCOUNT_MISSING');
+                }
+
+                const payoutLog = await client.query(
+                    `INSERT INTO roulette_transactions
+                        (player_id, match_id, type, amount)
+                     VALUES ($1, $2, 'match_payout', $3)
+                     ON CONFLICT DO NOTHING
+                     RETURNING id`,
+                    [winner, req.params.matchId, payout]
+                );
+
+                if (payoutLog.rowCount !== 1) {
+                    throw new Error('PAYOUT_ALREADY_RECORDED');
+                }
+
+                await client.query(
+                    `UPDATE roulette_accounts
+                     SET balance = balance + $2,
+                         updated_at = NOW()
+                     WHERE player_id = $1`,
+                    [winner, payout]
+                );
+
+                await client.query(
+                    `UPDATE roulette_matches
+                     SET status = 'finished',
+                         players = $2::jsonb,
+                         winner = $3,
+                         last_round = $4::jsonb,
+                         finished_at = NOW(),
+                         updated_at = NOW()
+                     WHERE id = $1`,
+                    [
+                        req.params.matchId,
+                        JSON.stringify(playersData),
+                        winner,
+                        JSON.stringify(lastRound)
+                    ]
+                );
             }
+
         } else {
-            await client.query('UPDATE roulette_matches SET players=$2::jsonb, updated_at=NOW() WHERE id=$1', [req.params.matchId, JSON.stringify(playersData)]);
+            await client.query(
+                `UPDATE roulette_matches
+                 SET players = $2::jsonb,
+                     updated_at = NOW()
+                 WHERE id = $1`,
+                [req.params.matchId, JSON.stringify(playersData)]
+            );
         }
+
         await client.query('COMMIT');
-        const playedReels = player.reels || lastRound?.players?.find(p => p.id === playerId)?.reels || [];
-        const playedScore = player.score ?? lastRound?.players?.find(p => p.id === playerId)?.score;
-        res.json({
+
+        const playedReels =
+            player.reels ||
+            lastRound?.players?.find(p => p.id === canonicalId)?.reels ||
+            [];
+
+        const playedScore =
+            player.score ??
+            lastRound?.players?.find(p => p.id === canonicalId)?.score;
+
+        return res.json({
             success: true,
             reels: playedReels,
             score: playedScore,
             multiplier: getRouletteMultiplier(playedReels),
             jackpot: getRouletteJackpot(playedReels),
             waitingForOpponent: !bothSpun,
-            status: nextRound ? 'draw' : (bothSpun ? 'finished' : 'playing'),
+            status: nextRound
+                ? 'draw'
+                : (bothSpun ? 'finished' : 'playing'),
             round: Number(match.round_number) + (nextRound ? 1 : 0),
             lastRound
         });
+
     } catch (error) {
-        if (client) await client.query('ROLLBACK').catch(() => {});
-        const map={MATCH_NOT_FOUND:[404,'Match not found'],MATCH_NOT_PLAYING:[409,'Матч сейчас не принимает броски'],NOT_PARTICIPANT:[403,'You are not a participant'],ALREADY_SPUN:[409,'Вы уже сделали бросок'],WINNER_ACCOUNT_MISSING:[503,'Winner account missing']};
-        const [code,message]=map[error.message]||[503,'Database temporarily unavailable'];
-        res.status(code).json({error:message});
-    } finally { if (client) client.release(); }
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const map = {
+            MATCH_NOT_FOUND: [404, 'Match not found'],
+            MATCH_NOT_PLAYING: [409, 'Матч сейчас не принимает броски'],
+            NOT_PARTICIPANT: [403, 'You are not a participant'],
+            ALREADY_SPUN: [409, 'Вы уже сделали бросок'],
+            WINNER_ACCOUNT_MISSING: [503, 'Winner account missing'],
+            PAYOUT_ALREADY_RECORDED: [409, 'Payout already recorded']
+        };
+
+        const [code, message] = map[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Roulette spin failed:', error);
+
+        return res.status(code).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 });
 
 // ========================================
@@ -1360,6 +2046,18 @@ async function initializeDatabase() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS roulette_player_aliases (
+            alias_id TEXT PRIMARY KEY,
+            player_id TEXT NOT NULL
+                REFERENCES roulette_accounts(player_id)
+                ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (alias_id <> player_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_roulette_player_aliases_player
+            ON roulette_player_aliases (player_id);
 
         CREATE TABLE IF NOT EXISTS roulette_cooldowns (
             player_id TEXT PRIMARY KEY REFERENCES roulette_accounts(player_id) ON DELETE CASCADE,
