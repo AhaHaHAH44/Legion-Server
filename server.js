@@ -1123,33 +1123,25 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
             ORDER BY s.created_at ASC
         `);
 
-        // Игроки с наибольшим количеством джекпотов
+        // Топ-3 самых удачливых котика
         const luckiestResult = await pool.query(`
             SELECT
                 a.player_id,
                 a.nickname,
                 COUNT(s.id) AS jackpots
-
+        
             FROM roulette_accounts a
-
+        
             JOIN roulette_spins s
                 ON s.player_id = a.player_id
-
+        
             WHERE s.jackpot = TRUE
-
+        
             GROUP BY a.player_id, a.nickname
-
-            HAVING COUNT(s.id) = (
-                SELECT MAX(jackpot_count)
-                FROM (
-                    SELECT COUNT(*) AS jackpot_count
-                    FROM roulette_spins
-                    WHERE jackpot = TRUE
-                    GROUP BY player_id
-                ) AS counts
-            )
-
-            ORDER BY a.nickname ASC
+        
+            ORDER BY COUNT(s.id) DESC, a.nickname ASC
+        
+            LIMIT 3
         `);
 
         const convertNumbers = rows => rows.map(row => ({
