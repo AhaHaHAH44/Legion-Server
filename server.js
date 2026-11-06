@@ -842,7 +842,7 @@ app.get('/api/matches/player/:playerId', async (req, res) => {
         const result = await pool.query(
             `SELECT id, status, mode, players, stake, pot, winner
              FROM knb_matches
-             WHERE status IN ('choosing_mode', 'negotiating', 'playing')
+             WHERE status IN ('choosing_mode', 'negotiating', 'playing', 'cancelled')
              AND players @> $1::jsonb
              ORDER BY created_at DESC
              LIMIT 1`,
