@@ -63,6 +63,128 @@ async function resolvePlayerId(playerId, db = pool) {
         : playerId;
 }
 
+// Создаёт игроку стандартные слоты инвентаря
+async function ensurePlayerInventorySlots(db, playerId) {
+    await db.query(
+        `
+        INSERT INTO inventory_slots (
+            player_id,
+            slot_type,
+            slot_number
+        )
+        SELECT
+            $1,
+            types.slot_type,
+            slots.slot_number
+        FROM inventory_slot_types AS types
+        CROSS JOIN LATERAL generate_series(
+            1,
+            types.default_slots
+        ) AS slots(slot_number)
+        WHERE types.is_active = TRUE
+        ON CONFLICT (
+            player_id,
+            slot_type,
+            slot_number
+        ) DO NOTHING
+        `,
+        [playerId]
+    );
+}
+
+// Выдать предмет игроку
+async function grantInventoryItem(db, playerId, itemCode, quantity = 1) {
+    if (
+        typeof playerId !== 'string' ||
+        typeof itemCode !== 'string' ||
+        !Number.isSafeInteger(quantity) ||
+        quantity < 1
+    ) {
+        throw new Error('INVALID_ITEM_GRANT');
+    }
+
+    // Блокируем запись каталога для безопасной выдачи
+    const itemResult = await db.query(
+        `SELECT
+            code,
+            is_stackable,
+            max_stack
+         FROM inventory_items
+         WHERE code = $1
+           AND is_active = TRUE
+         FOR UPDATE`,
+        [itemCode]
+    );
+
+    if (!itemResult.rowCount) {
+        throw new Error('INVENTORY_ITEM_NOT_FOUND');
+    }
+
+    const item = itemResult.rows[0];
+
+    if (!item.is_stackable && quantity !== 1) {
+        throw new Error('ITEM_NOT_STACKABLE');
+    }
+
+    // Проверяем, есть ли предмет у игрока
+    const existing = await db.query(
+        `SELECT quantity
+         FROM player_inventory
+         WHERE player_id = $1
+           AND item_code = $2
+         FOR UPDATE`,
+        [playerId, itemCode]
+    );
+
+    if (existing.rowCount) {
+        if (!item.is_stackable) {
+            throw new Error('ITEM_ALREADY_OWNED');
+        }
+
+        const newQuantity =
+            Number(existing.rows[0].quantity) + quantity;
+
+        if (newQuantity > item.max_stack) {
+            throw new Error('ITEM_STACK_LIMIT');
+        }
+
+        await db.query(
+            `UPDATE player_inventory
+             SET quantity = $3,
+                 updated_at = NOW()
+             WHERE player_id = $1
+               AND item_code = $2`,
+            [playerId, itemCode, newQuantity]
+        );
+
+        return {
+            itemCode,
+            quantity: newQuantity,
+            added: quantity
+        };
+    }
+
+    if (quantity > item.max_stack) {
+        throw new Error('ITEM_STACK_LIMIT');
+    }
+
+    await db.query(
+        `INSERT INTO player_inventory (
+            player_id,
+            item_code,
+            quantity
+         )
+         VALUES ($1, $2, $3)`,
+        [playerId, itemCode, quantity]
+    );
+
+    return {
+        itemCode,
+        quantity,
+        added: quantity
+    };
+}
+
 function cleanup() {
     const now = Date.now();
 
@@ -3054,6 +3176,526 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
     }
 });
 
+ // ========================================
+ // INVENTORY API
+ // ========================================
+
+ // Получить общий каталог предметов и типы слотов
+ app.get('/api/inventory/catalog', async (req, res) => {
+     try {
+         const items = await pool.query(
+             `SELECT
+                 code,
+                 name,
+                 description,
+                 category,
+                 rarity,
+                 icon,
+                 is_stackable,
+                 max_stack,
+                 metadata
+              FROM inventory_items
+              WHERE is_active = TRUE
+              ORDER BY category, sort_order, name`
+         );
+
+         const slotTypes = await pool.query(
+             `SELECT
+                 slot_type,
+                 name,
+                 accepted_categories,
+                 default_slots
+              FROM inventory_slot_types
+              WHERE is_active = TRUE
+              ORDER BY sort_order`
+         );
+
+         return res.json({
+             success: true,
+             items: items.rows,
+             slotTypes: slotTypes.rows
+         });
+
+     } catch (error) {
+         console.error('Inventory catalog retrieval failed:', error);
+
+         return res.status(503).json({
+             error: 'Database temporarily unavailable'
+         });
+     }
+ });
+
+ // Получить инвентарь конкретного игрока
+ app.get('/api/inventory/:playerId', async (req, res) => {
+     try {
+         const playerId = await resolvePlayerId(req.params.playerId);
+
+         // Проверяем существование аккаунта
+         const account = await pool.query(
+             `SELECT player_id
+              FROM roulette_accounts
+              WHERE player_id = $1`,
+             [playerId]
+         );
+
+         if (!account.rowCount) {
+             return res.status(404).json({
+                 error: 'Player not found'
+             });
+         }
+
+         // Создаём стандартные слоты, если их ещё нет
+         await ensurePlayerInventorySlots(pool, playerId);
+
+         // Получаем предметы игрока
+         const items = await pool.query(
+             `SELECT
+                 i.code,
+                 i.name,
+                 i.description,
+                 i.category,
+                 i.rarity,
+                 i.icon,
+                 i.metadata,
+                 pi.quantity,
+                 e.slot_type,
+                 e.slot_number,
+                 (e.item_code IS NOT NULL) AS equipped
+              FROM player_inventory pi
+              JOIN inventory_items i
+                 ON i.code = pi.item_code
+              LEFT JOIN player_equipment e
+                 ON e.player_id = pi.player_id
+                 AND e.item_code = pi.item_code
+              WHERE pi.player_id = $1
+              ORDER BY i.category, i.sort_order, i.name`,
+             [playerId]
+         );
+
+         // Получаем все слоты игрока
+         const slots = await pool.query(
+             `SELECT
+                 s.slot_type,
+                 t.name AS slot_name,
+                 s.slot_number,
+                 t.accepted_categories,
+                 e.item_code,
+                 i.name AS item_name,
+                 i.icon AS item_icon,
+                 i.rarity AS item_rarity
+              FROM inventory_slots s
+              JOIN inventory_slot_types t
+                 ON t.slot_type = s.slot_type
+              LEFT JOIN player_equipment e
+                 ON e.player_id = s.player_id
+                 AND e.slot_type = s.slot_type
+                 AND e.slot_number = s.slot_number
+              LEFT JOIN inventory_items i
+                 ON i.code = e.item_code
+              WHERE s.player_id = $1
+              ORDER BY t.sort_order, s.slot_number`,
+             [playerId]
+         );
+
+         return res.json({
+             success: true,
+             playerId,
+             items: items.rows,
+             slots: slots.rows
+         });
+
+     } catch (error) {
+         console.error('Player inventory retrieval failed:', error);
+
+         return res.status(503).json({
+             error: 'Database temporarily unavailable'
+         });
+     }
+ });
+
+ // Экипировать предмет в слот
+ app.post('/api/inventory/equip', async (req, res) => {
+     const { playerId, itemCode, slotType, slotNumber } = req.body || {};
+
+     if (
+         typeof playerId !== 'string' ||
+         typeof itemCode !== 'string' ||
+         typeof slotType !== 'string' ||
+         !Number.isSafeInteger(slotNumber) ||
+         slotNumber < 1
+     ) {
+         return res.status(400).json({
+             error: 'Invalid equipment data'
+         });
+     }
+
+     let client;
+
+     try {
+         const canonicalId = await resolvePlayerId(playerId);
+
+         client = await pool.connect();
+         await client.query('BEGIN');
+
+         // Проверяем существование игрока
+         const account = await client.query(
+             `SELECT player_id
+              FROM roulette_accounts
+              WHERE player_id = $1
+              FOR UPDATE`,
+             [canonicalId]
+         );
+
+         if (!account.rowCount) {
+             throw new Error('PLAYER_NOT_FOUND');
+         }
+
+         // Создаём стандартные слоты, если их ещё нет
+         await ensurePlayerInventorySlots(client, canonicalId);
+
+         // Блокируем выбранный слот
+         const slot = await client.query(
+             `SELECT
+                 s.slot_type,
+                 s.slot_number,
+                 t.accepted_categories,
+                 e.item_code
+              FROM inventory_slots s
+              JOIN inventory_slot_types t
+                 ON t.slot_type = s.slot_type
+              LEFT JOIN player_equipment e
+                 ON e.player_id = s.player_id
+                 AND e.slot_type = s.slot_type
+                 AND e.slot_number = s.slot_number
+              WHERE s.player_id = $1
+                AND s.slot_type = $2
+                AND s.slot_number = $3
+                AND t.is_active = TRUE
+              FOR UPDATE OF s`,
+             [canonicalId, slotType, slotNumber]
+         );
+
+         if (!slot.rowCount) {
+             throw new Error('SLOT_NOT_FOUND');
+         }
+
+         if (slot.rows[0].item_code !== null) {
+             throw new Error('SLOT_OCCUPIED');
+         }
+
+         // Проверяем владение предметом и совместимость категории
+         const item = await client.query(
+             `SELECT i.code, i.category
+              FROM player_inventory pi
+              JOIN inventory_items i
+                 ON i.code = pi.item_code
+              WHERE pi.player_id = $1
+                AND pi.item_code = $2
+                AND pi.quantity > 0
+                AND i.is_active = TRUE
+              FOR UPDATE OF pi`,
+             [canonicalId, itemCode]
+         );
+
+         if (!item.rowCount) {
+             throw new Error('ITEM_NOT_OWNED');
+         }
+
+         if (
+             !slot.rows[0].accepted_categories.includes(
+                 item.rows[0].category
+             )
+         ) {
+             throw new Error('CATEGORY_MISMATCH');
+         }
+
+         // Добавляем предмет в экипировку
+         await client.query(
+             `INSERT INTO player_equipment (
+                 player_id,
+                 item_code,
+                 slot_type,
+                 slot_number
+              )
+              VALUES ($1, $2, $3, $4)`,
+             [canonicalId, itemCode, slotType, slotNumber]
+         );
+
+         await client.query('COMMIT');
+
+         return res.json({
+             success: true,
+             message: 'Item equipped',
+             itemCode,
+             slotType,
+             slotNumber
+         });
+
+     } catch (error) {
+         if (client) {
+             await client.query('ROLLBACK').catch(() => {});
+         }
+
+         const errors = {
+             PLAYER_NOT_FOUND: [404, 'Player not found'],
+             SLOT_NOT_FOUND: [404, 'Slot not found'],
+             SLOT_OCCUPIED: [409, 'Slot is already occupied'],
+             ITEM_NOT_OWNED: [403, 'You do not own this item'],
+             CATEGORY_MISMATCH: [400, 'Item category is not accepted by this slot']
+         };
+
+         const [status, message] = errors[error.message] || (
+             error.code === '23505'
+                 ? [409, 'Item or slot is already equipped']
+                 : [503, 'Database temporarily unavailable']
+         );
+
+         console.error('Item equipment failed:', error);
+
+         return res.status(status).json({
+             error: message
+         });
+
+     } finally {
+         if (client) {
+             client.release();
+         }
+     }
+ });
+
+ // Снять предмет со слота
+ app.post('/api/inventory/unequip', async (req, res) => {
+     const { playerId, slotType, slotNumber } = req.body || {};
+
+     if (
+         typeof playerId !== 'string' ||
+         typeof slotType !== 'string' ||
+         !Number.isSafeInteger(slotNumber) ||
+         slotNumber < 1
+     ) {
+         return res.status(400).json({
+             error: 'Invalid unequip data'
+         });
+     }
+
+     let client;
+
+     try {
+         const canonicalId = await resolvePlayerId(playerId);
+
+         client = await pool.connect();
+         await client.query('BEGIN');
+
+         // Проверяем существование игрока
+         const account = await client.query(
+             `SELECT player_id
+              FROM roulette_accounts
+              WHERE player_id = $1
+              FOR UPDATE`,
+             [canonicalId]
+         );
+
+         if (!account.rowCount) {
+             throw new Error('PLAYER_NOT_FOUND');
+         }
+
+         // Блокируем выбранный слот
+         const slot = await client.query(
+             `SELECT
+                 s.slot_type,
+                 s.slot_number,
+                 e.item_code
+              FROM inventory_slots s
+              LEFT JOIN player_equipment e
+                 ON e.player_id = s.player_id
+                 AND e.slot_type = s.slot_type
+                 AND e.slot_number = s.slot_number
+              WHERE s.player_id = $1
+                AND s.slot_type = $2
+                AND s.slot_number = $3
+              FOR UPDATE OF s`,
+             [canonicalId, slotType, slotNumber]
+         );
+
+         if (!slot.rowCount) {
+             throw new Error('SLOT_NOT_FOUND');
+         }
+
+         const itemCode = slot.rows[0].item_code;
+
+         if (!itemCode) {
+             throw new Error('SLOT_EMPTY');
+         }
+
+         // Удаляем экипировку, но сохраняем предмет в инвентаре
+         await client.query(
+             `DELETE FROM player_equipment
+              WHERE player_id = $1
+                AND slot_type = $2
+                AND slot_number = $3`,
+             [canonicalId, slotType, slotNumber]
+         );
+
+         await client.query('COMMIT');
+
+         return res.json({
+             success: true,
+             message: 'Item unequipped',
+             itemCode,
+             slotType,
+             slotNumber
+         });
+
+     } catch (error) {
+         if (client) {
+             await client.query('ROLLBACK').catch(() => {});
+         }
+
+         const errors = {
+             PLAYER_NOT_FOUND: [404, 'Player not found'],
+             SLOT_NOT_FOUND: [404, 'Slot not found'],
+             SLOT_EMPTY: [409, 'Slot is already empty']
+         };
+
+         const [status, message] = errors[error.message] || [
+             503,
+             'Database temporarily unavailable'
+         ];
+
+         console.error('Item unequipment failed:', error);
+
+         return res.status(status).json({
+             error: message
+         });
+
+     } finally {
+         if (client) {
+             client.release();
+         }
+     }
+ });
+
+ // Административная выдача предметов игрокам
+ app.post('/api/inventory/grant', async (req, res) => {
+     const adminKey = process.env.INVENTORY_ADMIN_KEY;
+     const providedKey = req.get('x-inventory-admin-key');
+
+     // Если секретный ключ не настроен, выдача отключена
+     if (!adminKey) {
+         return res.status(503).json({
+             error: 'Inventory administration is not configured'
+         });
+     }
+
+     if (typeof providedKey !== 'string') {
+         return res.status(401).json({
+             error: 'Unauthorized'
+         });
+     }
+
+     // Безопасное сравнение ключей
+     const expectedBuffer = Buffer.from(adminKey, 'utf8');
+     const providedBuffer = Buffer.from(providedKey, 'utf8');
+
+     if (
+         expectedBuffer.length !== providedBuffer.length ||
+         !crypto.timingSafeEqual(expectedBuffer, providedBuffer)
+     ) {
+         return res.status(401).json({
+             error: 'Unauthorized'
+         });
+     }
+
+     const { playerId, itemCode, quantity = 1 } = req.body || {};
+
+     if (
+         typeof playerId !== 'string' ||
+         !playerId.trim() ||
+         typeof itemCode !== 'string' ||
+         !itemCode.trim() ||
+         !Number.isSafeInteger(quantity) ||
+         quantity < 1 ||
+         quantity > 100
+     ) {
+         return res.status(400).json({
+             error: 'Invalid item grant data'
+         });
+     }
+
+     let client;
+
+     try {
+         client = await pool.connect();
+         await client.query('BEGIN');
+
+         const canonicalId = await resolvePlayerId(playerId, client);
+
+         // Проверяем существование аккаунта
+         const account = await client.query(
+             `SELECT player_id
+              FROM roulette_accounts
+              WHERE player_id = $1
+              FOR UPDATE`,
+             [canonicalId]
+         );
+
+         if (!account.rowCount) {
+             throw new Error('PLAYER_NOT_FOUND');
+         }
+
+         // Выдаём предмет
+         const result = await grantInventoryItem(
+             client,
+             canonicalId,
+             itemCode,
+             quantity
+         );
+
+         await client.query('COMMIT');
+
+         console.log(
+             `Inventory item granted: ${itemCode} x${quantity} -> ${canonicalId}`
+         );
+
+         return res.json({
+             success: true,
+             message: 'Item granted',
+             playerId: canonicalId,
+             ...result
+         });
+
+     } catch (error) {
+         if (client) {
+             await client.query('ROLLBACK').catch(() => {});
+         }
+
+         const errors = {
+             PLAYER_NOT_FOUND: [404, 'Player not found'],
+             INVALID_ITEM_GRANT: [400, 'Invalid item grant'],
+             INVENTORY_ITEM_NOT_FOUND: [404, 'Inventory item not found'],
+             ITEM_NOT_STACKABLE: [409, 'This item cannot be stacked'],
+             ITEM_ALREADY_OWNED: [409, 'Player already owns this item'],
+             ITEM_STACK_LIMIT: [409, 'Maximum stack size exceeded']
+         };
+
+         const [status, message] = errors[error.message] || [
+             503,
+             'Database temporarily unavailable'
+         ];
+
+         console.error('Administrative item grant failed:', error);
+
+         return res.status(status).json({
+             error: message
+         });
+
+     } finally {
+         if (client) {
+             client.release();
+         }
+     }
+ });
+
 // ========================================
 // LEGION SHOP API
 // ========================================
@@ -3153,9 +3795,15 @@ app.post('/api/shop/purchase', async (req, res) => {
 
         // Проверяем существование и доступность товара
         const item = await client.query(
-            `SELECT code, name, price, category
+            `SELECT
+                code,
+                name,
+                price,
+                category,
+                inventory_item_code
              FROM shop_items
-             WHERE code = $1 AND is_active = TRUE`,
+             WHERE code = $1
+               AND is_active = TRUE`,
             [itemCode]
         );
 
@@ -3207,6 +3855,17 @@ app.post('/api/shop/purchase', async (req, res) => {
             [canonicalId, itemCode, price]
         );
 
+        // Если товар связан с предметом инвентаря,
+        // выдаём его игроку в рамках текущей транзакции
+        if (product.inventory_item_code) {
+            await grantInventoryItem(
+                client,
+                canonicalId,
+                product.inventory_item_code,
+                1
+            );
+        }
+
         // Сохраняем операцию в истории транзакций
         await client.query(
             `INSERT INTO roulette_transactions
@@ -3246,7 +3905,12 @@ app.post('/api/shop/purchase', async (req, res) => {
             PLAYER_NOT_FOUND: [404, 'Player not found'],
             ITEM_NOT_FOUND: [404, 'Товар не найден или больше недоступен'],
             ALREADY_OWNED: [409, 'Этот товар уже куплен'],
-            INSUFFICIENT_BALANCE: [409, 'Недостаточно мяукоинов']
+            INSUFFICIENT_BALANCE: [409, 'Недостаточно мяукоинов'],
+            INVALID_ITEM_GRANT: [400, 'Invalid item grant'],
+            INVENTORY_ITEM_NOT_FOUND: [404, 'Предмет инвентаря не найден'],
+            ITEM_NOT_STACKABLE: [409, 'Этот предмет нельзя складывать'],
+            ITEM_ALREADY_OWNED: [409, 'Этот предмет уже есть в инвентаре'],
+            ITEM_STACK_LIMIT: [409, 'Достигнут максимальный размер стопки']
         };
 
         const [status, message] = errors[error.message] || [
@@ -3471,6 +4135,171 @@ async function initializeDatabase() {
     
                 UNIQUE (player_id, item_code)
             );
+
+            
+            -- ========================================
+            -- INVENTORY SYSTEM
+            -- ========================================
+            
+            -- Каталог всех предметов игры
+            CREATE TABLE IF NOT EXISTS inventory_items (
+                code TEXT PRIMARY KEY,
+            
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+            
+                category TEXT NOT NULL,
+                rarity TEXT NOT NULL DEFAULT 'common',
+            
+                icon TEXT,
+            
+                is_stackable BOOLEAN NOT NULL DEFAULT FALSE,
+                max_stack INTEGER NOT NULL DEFAULT 1
+                    CHECK (max_stack >= 1),
+            
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            
+                sort_order INTEGER NOT NULL DEFAULT 0,
+            
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            
+            
+            -- Типы слотов и допустимые категории предметов
+            CREATE TABLE IF NOT EXISTS inventory_slot_types (
+                slot_type TEXT PRIMARY KEY,
+            
+                name TEXT NOT NULL,
+            
+                accepted_categories TEXT[] NOT NULL,
+            
+                default_slots INTEGER NOT NULL DEFAULT 1
+                    CHECK (default_slots >= 0),
+            
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+            
+            
+            -- Предметы, принадлежащие игрокам
+            CREATE TABLE IF NOT EXISTS player_inventory (
+                player_id TEXT NOT NULL
+                    REFERENCES roulette_accounts(player_id)
+                    ON DELETE CASCADE,
+            
+                item_code TEXT NOT NULL
+                    REFERENCES inventory_items(code),
+            
+                quantity INTEGER NOT NULL DEFAULT 1
+                    CHECK (quantity > 0),
+            
+                acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            
+                PRIMARY KEY (player_id, item_code)
+            );
+            
+            
+            -- Слоты, принадлежащие игрокам
+            CREATE TABLE IF NOT EXISTS inventory_slots (
+                player_id TEXT NOT NULL
+                    REFERENCES roulette_accounts(player_id)
+                    ON DELETE CASCADE,
+            
+                slot_type TEXT NOT NULL
+                    REFERENCES inventory_slot_types(slot_type),
+            
+                slot_number INTEGER NOT NULL
+                    CHECK (slot_number >= 1),
+            
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            
+                PRIMARY KEY (player_id, slot_type, slot_number)
+            );
+            
+            
+            -- Экипированные предметы
+            CREATE TABLE IF NOT EXISTS player_equipment (
+                player_id TEXT NOT NULL,
+            
+                item_code TEXT NOT NULL,
+            
+                slot_type TEXT NOT NULL,
+                slot_number INTEGER NOT NULL,
+            
+                equipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            
+                -- Один предмет не может находиться в нескольких слотах
+                PRIMARY KEY (player_id, item_code),
+            
+                -- Один слот не может содержать несколько предметов
+                UNIQUE (player_id, slot_type, slot_number),
+            
+                FOREIGN KEY (player_id, item_code)
+                    REFERENCES player_inventory(player_id, item_code)
+                    ON DELETE CASCADE,
+            
+                FOREIGN KEY (player_id, slot_type, slot_number)
+                    REFERENCES inventory_slots(player_id, slot_type, slot_number)
+                    ON DELETE CASCADE
+            );
+            
+            
+            -- Индексы для быстрого получения предметов игрока
+            CREATE INDEX IF NOT EXISTS idx_player_inventory_player
+                ON player_inventory (player_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_player_equipment_player
+                ON player_equipment (player_id);
+            
+            
+            -- ========================================
+            -- DEFAULT INVENTORY SLOT TYPES
+            -- ========================================
+            
+            -- Два слота для модификаторов рулетки
+            INSERT INTO inventory_slot_types (
+                slot_type,
+                name,
+                accepted_categories,
+                default_slots,
+                sort_order
+            )
+            VALUES (
+                'roulette_modifier',
+                'Модификаторы рулетки',
+                ARRAY['roulette_modifier'],
+                2,
+                1
+            )
+            ON CONFLICT (slot_type) DO NOTHING;
+            
+            
+            -- Один слот для косметических предметов
+            INSERT INTO inventory_slot_types (
+                slot_type,
+                name,
+                accepted_categories,
+                default_slots,
+                sort_order
+            )
+            VALUES (
+                'cosmetic',
+                'Косметика',
+                ARRAY['cosmetic'],
+                1,
+                2
+            )
+            ON CONFLICT (slot_type) DO NOTHING;
+            
+            
+            -- Связь товаров магазина с предметами инвентаря
+            ALTER TABLE shop_items
+            ADD COLUMN IF NOT EXISTS inventory_item_code TEXT
+            REFERENCES inventory_items(code);
     
             CREATE INDEX IF NOT EXISTS idx_player_purchases_player
                 ON player_purchases (player_id);
