@@ -2277,9 +2277,27 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
         if (!sessionResult.rowCount) {
             throw new Error('SESSION_NOT_FOUND');
         }
-
+        
         const session = sessionResult.rows[0];
 
+        // Если вращение уже завершено — возвращаем сохранённый результат
+        if (session.status === 'completed') {
+            if (session.completion_result) {
+                const savedResult = typeof session.completion_result === 'string'
+                    ? JSON.parse(session.completion_result)
+                    : session.completion_result;
+        
+                await client.query('COMMIT');
+        
+                return res.json({
+                    ...savedResult,
+                    alreadyCompleted: true
+                });
+            }
+        
+            throw new Error('SESSION_NOT_PENDING');
+        }
+        
         if (session.status !== 'pending') {
             throw new Error('SESSION_NOT_PENDING');
         }
@@ -2486,9 +2504,27 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         if (!sessionResult.rowCount) {
             throw new Error('SESSION_NOT_FOUND');
         }
-
+        
         const session = sessionResult.rows[0];
 
+        // Если вращение уже завершено — возвращаем сохранённый результат
+        if (session.status === 'completed') {
+            if (session.completion_result) {
+                const savedResult = typeof session.completion_result === 'string'
+                    ? JSON.parse(session.completion_result)
+                    : session.completion_result;
+        
+                await client.query('COMMIT');
+        
+                return res.json({
+                    ...savedResult,
+                    alreadyCompleted: true
+                });
+            }
+        
+            throw new Error('SESSION_NOT_PENDING');
+        }
+        
         if (session.status !== 'pending') {
             throw new Error('SESSION_NOT_PENDING');
         }
@@ -2569,17 +2605,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         );
 
         // Закрываем сессию
-        await client.query(
-            `UPDATE roulette_solo_sessions
-             SET status = 'completed',
-                 completed_at = NOW()
-             WHERE id = $1`,
-            [sessionId]
-        );
-
-        await client.query('COMMIT');
-
-        return res.json({
+        // Формируем результат вращения
+        const completionResult = {
             success: true,
             mode: 'solo',
             sessionId,
@@ -2589,7 +2616,21 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             jackpot,
             modifierDrop,
             balance: newBalance
-        });
+        };
+        
+        // Закрываем сессию и сохраняем результат
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET status = 'completed',
+                 completed_at = NOW(),
+                 completion_result = $2::jsonb
+             WHERE id = $1`,
+            [sessionId, JSON.stringify(completionResult)]
+        );
+        
+        await client.query('COMMIT');
+
+        return res.json(completionResult);
 
     } catch (error) {
         if (client) {
@@ -4558,8 +4599,9 @@ async function initializeDatabase() {
 
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             expires_at TIMESTAMPTZ NOT NULL,
-            completed_at TIMESTAMPTZ
-        );
+            completed_at TIMESTAMPTZ,
+            completion_result JSONB
+            );
 
         -- Не допускаем несколько незавершённых вращений одного игрока
         CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_solo_one_pending
@@ -4577,6 +4619,8 @@ async function initializeDatabase() {
             ON roulette_spins (jackpot, score DESC);
 
         -- Additive migrations for databases created by earlier 2.0.x builds.
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS completion_result JSONB;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
