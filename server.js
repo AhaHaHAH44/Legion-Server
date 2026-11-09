@@ -273,6 +273,101 @@ function getRouletteJackpot(reels) {
     return reels.length === 3 && reels.every(item => item.id === reels[0].id);
 }
 
+// ========================================
+// ВЫДАЧА МОДИФИКАТОРОВ ЗА СОЛО-ДЖЕКПОТ
+// ========================================
+
+async function grantRouletteJackpotModifier(db, playerId, reels) {
+    // Проверяем, что выпал джекпот из трёх одинаковых ресурсов
+    if (!getRouletteJackpot(reels)) {
+        return null;
+    }
+
+    // Какой модификатор соответствует каждому ресурсу
+    const rewards = {
+        pebble: {
+            unlockCode: 'roulette_unlock_pebble',
+            itemCode: 'roulette_mod_reroll',
+            name: 'Переброс'
+        },
+        limestone: {
+            unlockCode: 'roulette_unlock_limestone',
+            itemCode: 'roulette_mod_pair_save',
+            name: 'Сохранение пары'
+        },
+        iron: {
+            unlockCode: 'roulette_unlock_iron',
+            itemCode: 'roulette_mod_lock',
+            name: 'Закрепление'
+        },
+        coal: {
+            unlockCode: 'roulette_unlock_coal',
+            itemCode: 'roulette_mod_second_chance',
+            name: 'Вторая попытка'
+        },
+        gold: {
+            unlockCode: 'roulette_unlock_gold',
+            itemCode: 'roulette_mod_duplicate',
+            name: 'Дублирование'
+        },
+        topaz: {
+            unlockCode: 'roulette_unlock_topaz',
+            itemCode: 'roulette_mod_transmutation',
+            name: 'Трансмутация'
+        }
+    };
+
+    const reward = rewards[reels[0].id];
+
+    if (!reward) {
+        return null;
+    }
+
+    // Проверяем, купил ли игрок соответствующую разблокировку
+    const unlocked = await db.query(
+        `SELECT id
+         FROM player_purchases
+         WHERE player_id = $1
+           AND item_code = $2`,
+        [playerId, reward.unlockCode]
+    );
+
+    // Без разблокировки модификатор не выдаётся
+    if (!unlocked.rowCount) {
+        return null;
+    }
+
+    // Выдаём один экземпляр модификатора
+    try {
+        await grantInventoryItem(
+            db,
+            playerId,
+            reward.itemCode,
+            1
+        );
+    
+        return {
+            code: reward.itemCode,
+            name: reward.name,
+            granted: true
+        };
+    
+    } catch (error) {
+        // Переполненная стопка не должна отменять результат рулетки
+        if (error.message === 'ITEM_STACK_LIMIT') {
+            return {
+                code: reward.itemCode,
+                name: reward.name,
+                granted: false,
+                reason: 'stack_full'
+            };
+        }
+    
+        // Остальные ошибки по-прежнему должны отменять транзакцию
+        throw error;
+    }
+}
+
 // Сериализуем создание совместных матчей для одних и тех же игроков.
 // Advisory-lock берётся в стабильном порядке, чтобы избежать взаимных блокировок.
 async function lockRoulettePlayers(client, playerIds) {
@@ -1998,6 +2093,15 @@ app.post('/api/roulette/solo', async (req, res) => {
 
         const reels = spinRoulette();
         const score = getRouletteScore(reels);
+
+        // Проверяем джекпот и выдаём модификатор,
+        // если игрок предварительно разблокировал эту механику.
+        const modifierDrop = await grantRouletteJackpotModifier(
+            client,
+            canonicalId,
+            reels
+        );
+        
         const newBalance = Number(account.rows[0].balance) + score;
 
         await client.query(
@@ -2016,7 +2120,8 @@ app.post('/api/roulette/solo', async (req, res) => {
                 score,
                 JSON.stringify({
                     reels,
-                    multiplier: getRouletteMultiplier(reels)
+                    multiplier: getRouletteMultiplier(reels),
+                    modifierDrop
                 })
             ]
         );
@@ -2053,6 +2158,7 @@ app.post('/api/roulette/solo', async (req, res) => {
             score,
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
+            modifierDrop,
             balance: newBalance,
             nextAt: newNextAt,
             cooldownMs: ROULETTE_COOLDOWN
@@ -4294,7 +4400,174 @@ async function initializeDatabase() {
                 2
             )
             ON CONFLICT (slot_type) DO NOTHING;
+
+            -- Отдельные слоты косметики рулетки:
+            -- эффект выпадения и оформление можно экипировать одновременно.
+            INSERT INTO inventory_slot_types (
+                slot_type,
+                name,
+                accepted_categories,
+                default_slots,
+                sort_order
+            )
+            VALUES
+                (
+                    'roulette_effect',
+                    'Эффект рулетки',
+                    ARRAY['roulette_effect'],
+                    1,
+                    3
+                ),
+                (
+                    'roulette_theme',
+                    'Оформление рулетки',
+                    ARRAY['roulette_theme'],
+                    1,
+                    4
+                )
+            ON CONFLICT (slot_type) DO NOTHING;
             
+            
+            -- Тестовая косметика для Кото-рулетки
+            INSERT INTO inventory_items (
+                code,
+                name,
+                description,
+                category,
+                rarity,
+                icon,
+                is_stackable,
+                max_stack,
+                is_active,
+                sort_order,
+                metadata
+            )
+            VALUES
+                (
+                    'roulette_effect_sparkles',
+                    'Искры',
+                    'Добавляет эффект искр при выпадении результата в Кото-рулетке.',
+                    'roulette_effect',
+                    'uncommon',
+                    '✨',
+                    FALSE,
+                    1,
+                    TRUE,
+                    10,
+                    '{"cosmetic_type":"roulette_effect","effect_id":"sparkles"}'::jsonb
+                ),
+                (
+                    'roulette_theme_winter',
+                    'Зимняя рулетка',
+                    'Зимнее оформление Кото-рулетки со снежинками и холодной цветовой гаммой.',
+                    'roulette_theme',
+                    'rare',
+                    '❄️',
+                    FALSE,
+                    1,
+                    TRUE,
+                    20,
+                    '{"cosmetic_type":"roulette_theme","theme_id":"winter"}'::jsonb
+                )
+            ON CONFLICT (code) DO NOTHING;
+
+            -- ========================================
+            -- КОТО-РУЛЕТКА: МОДИФИКАТОРЫ
+            -- ========================================
+            
+            INSERT INTO inventory_items (
+                code,
+                name,
+                description,
+                category,
+                rarity,
+                icon,
+                is_stackable,
+                max_stack,
+                is_active,
+                sort_order,
+                metadata
+            )
+            VALUES
+            (
+                'roulette_mod_reroll',
+                'Переброс',
+                'Позволяет перебросить один выбранный символ в Кото-рулетке.',
+                'roulette_modifier',
+                'common',
+                '🔄',
+                TRUE,
+                99,
+                TRUE,
+                100,
+                '{"modifier_id":"reroll","trigger":"pebble_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_pair_save',
+                'Сохранение пары',
+                'Позволяет сохранить два одинаковых символа и перебросить третий.',
+                'roulette_modifier',
+                'uncommon',
+                '🛡️',
+                TRUE,
+                99,
+                TRUE,
+                110,
+                '{"modifier_id":"pair_save","trigger":"limestone_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_lock',
+                'Закрепление',
+                'Позволяет закрепить два выбранных символа и перебросить третий.',
+                'roulette_modifier',
+                'uncommon',
+                '🔒',
+                TRUE,
+                99,
+                TRUE,
+                120,
+                '{"modifier_id":"lock","trigger":"iron_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_second_chance',
+                'Вторая попытка',
+                'Позволяет получить второй полный результат рулетки и выбрать один из двух.',
+                'roulette_modifier',
+                'rare',
+                '🎲',
+                TRUE,
+                99,
+                TRUE,
+                130,
+                '{"modifier_id":"second_chance","trigger":"coal_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_duplicate',
+                'Дублирование',
+                'Позволяет скопировать один символ на другую позицию.',
+                'roulette_modifier',
+                'rare',
+                '✨',
+                TRUE,
+                99,
+                TRUE,
+                140,
+                '{"modifier_id":"duplicate","trigger":"gold_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_transmutation',
+                'Трансмутация',
+                'Позволяет заменить один символ на выбранный ресурс, включая топаз.',
+                'roulette_modifier',
+                'legendary',
+                '💎',
+                TRUE,
+                99,
+                TRUE,
+                150,
+                '{"modifier_id":"transmutation","trigger":"topaz_triple"}'::jsonb
+            )
+            ON CONFLICT (code) DO NOTHING;
             
             -- Связь товаров магазина с предметами инвентаря
             ALTER TABLE shop_items
@@ -4322,6 +4595,118 @@ async function initializeDatabase() {
                 TRUE
             )
             ON CONFLICT (code) DO NOTHING;
+
+            -- Тестовые косметические товары магазина
+            INSERT INTO shop_items (
+                code,
+                name,
+                description,
+                category,
+                price,
+                is_active,
+                metadata,
+                inventory_item_code
+            )
+            VALUES
+                (
+                    'roulette_sparkles',
+                    'Эффект «Искры»',
+                    'Косметический эффект искр при выпадении результата в Кото-рулетке.',
+                    'cosmetic',
+                    250,
+                    TRUE,
+                    '{"cosmetic_type":"roulette_effect","effect_id":"sparkles"}'::jsonb,
+                    'roulette_effect_sparkles'
+                ),
+                (
+                    'roulette_winter_theme',
+                    'Оформление «Зимняя рулетка»',
+                    'Зимняя тема Кото-рулетки со снежинками и холодной цветовой гаммой.',
+                    'cosmetic',
+                    400,
+                    TRUE,
+                    '{"cosmetic_type":"roulette_theme","theme_id":"winter"}'::jsonb,
+                    'roulette_theme_winter'
+                )
+            ON CONFLICT (code) DO NOTHING;
+
+            -- ========================================
+            -- КОТО-РУЛЕТКА: РАЗБЛОКИРОВКИ МЕХАНИК
+            -- ========================================
+            
+            INSERT INTO shop_items (
+                code,
+                name,
+                description,
+                category,
+                price,
+                is_active,
+                metadata,
+                inventory_item_code
+            )
+            VALUES
+            (
+                'roulette_unlock_pebble',
+                'Механика камушка',
+                'Разблокирует получение модификатора «Переброс» за джекпот из трёх камушков 🪨🪨🪨. При покупке вы получите один «Переброс» в подарок.',
+                'unlock',
+                100,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"pebble_triple"}'::jsonb,
+                'roulette_mod_reroll'
+            ),
+            (
+                'roulette_unlock_limestone',
+                'Механика известняка',
+                'Разблокирует получение модификатора «Сохранение пары» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
+                'unlock',
+                200,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"limestone_triple"}'::jsonb,
+                'roulette_mod_pair_save'
+            ),
+            (
+                'roulette_unlock_iron',
+                'Механика железа',
+                'Разблокирует получение модификатора «Закрепление» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
+                'unlock',
+                300,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"iron_triple"}'::jsonb,
+                'roulette_mod_lock'
+            ),
+            (
+                'roulette_unlock_coal',
+                'Механика угля',
+                'Разблокирует получение модификатора «Вторая попытка» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
+                'unlock',
+                400,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"coal_triple"}'::jsonb,
+                'roulette_mod_second_chance'
+            ),
+            (
+                'roulette_unlock_gold',
+                'Механика золота',
+                'Разблокирует получение модификатора «Дублирование» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
+                'unlock',
+                500,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"gold_triple"}'::jsonb,
+                'roulette_mod_duplicate'
+            ),
+            (
+                'roulette_unlock_topaz',
+                'Механика топаза',
+                'Разблокирует получение модификатора «Трансмутация» за джекпот из трёх топазов 💎💎💎. При покупке вы получите один модификатор в подарок.',
+                'unlock',
+                750,
+                TRUE,
+                '{"unlock_type":"roulette_modifier","trigger":"topaz_triple"}'::jsonb,
+                'roulette_mod_transmutation'
+            )
+            ON CONFLICT (code) DO NOTHING;
+            
     `);
     console.log('PostgreSQL schema is ready.');
 }
