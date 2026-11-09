@@ -2062,8 +2062,12 @@ app.post('/api/roulette/solo', async (req, res) => {
         client = await pool.connect();
         await client.query('BEGIN');
 
+        // Блокируем счёт игрока, чтобы не запустить два вращения одновременно
         const account = await client.query(
-            'SELECT balance FROM roulette_accounts WHERE player_id = $1 FOR UPDATE',
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
             [canonicalId]
         );
 
@@ -2071,8 +2075,65 @@ app.post('/api/roulette/solo', async (req, res) => {
             throw new Error('PLAYER_NOT_FOUND');
         }
 
+        // Ищем незавершённое вращение
+        const pending = await client.query(
+            `SELECT *
+             FROM roulette_solo_sessions
+             WHERE player_id = $1
+               AND status = 'pending'
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        // Если вращение ещё не истекло — возвращаем его
+        if (pending.rowCount) {
+            const session = pending.rows[0];
+            const expiresAt = new Date(session.expires_at).getTime();
+
+            if (expiresAt > Date.now()) {
+                const cooldown = await client.query(
+                    `SELECT next_at
+                     FROM roulette_cooldowns
+                     WHERE player_id = $1`,
+                    [canonicalId]
+                );
+
+                const nextAt = cooldown.rowCount
+                    ? Number(cooldown.rows[0].next_at)
+                    : 0;
+
+                await client.query('COMMIT');
+
+                return res.json({
+                    success: true,
+                    mode: 'solo',
+                    pending: true,
+                    sessionId: session.id,
+                    reels: session.reels,
+                    score: getRouletteScore(session.reels),
+                    multiplier: getRouletteMultiplier(session.reels),
+                    jackpot: getRouletteJackpot(session.reels),
+                    balance: Number(account.rows[0].balance),
+                    nextAt,
+                    cooldownMs: Math.max(0, nextAt - Date.now())
+                });
+            }
+
+            // Истёкшее вращение больше нельзя продолжить
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [session.id]
+            );
+        }
+
+        // Проверяем кулдаун
         const cooldown = await client.query(
-            'SELECT next_at FROM roulette_cooldowns WHERE player_id = $1 FOR UPDATE',
+            `SELECT next_at
+             FROM roulette_cooldowns
+             WHERE player_id = $1
+             FOR UPDATE`,
             [canonicalId]
         );
 
@@ -2091,54 +2152,32 @@ app.post('/api/roulette/solo', async (req, res) => {
             });
         }
 
+        // Генерируем предварительный результат
         const reels = spinRoulette();
-        const score = getRouletteScore(reels);
+        const sessionId = crypto.randomUUID();
 
-        // Проверяем джекпот и выдаём модификатор,
-        // если игрок предварительно разблокировал эту механику.
-        const modifierDrop = await grantRouletteJackpotModifier(
-            client,
-            canonicalId,
-            reels
-        );
-        
-        const newBalance = Number(account.rows[0].balance) + score;
+        // Сохраняем вращение на 30 минут
+        const expiresAt = new Date(now + 30 * 60 * 1000);
 
         await client.query(
-            `UPDATE roulette_accounts
-             SET balance = $2, updated_at = NOW()
-             WHERE player_id = $1`,
-            [canonicalId, newBalance]
-        );
-
-        await client.query(
-            `INSERT INTO roulette_transactions
-                (player_id, type, amount, details)
-             VALUES ($1, 'solo_reward', $2, $3::jsonb)`,
+            `INSERT INTO roulette_solo_sessions (
+                id,
+                player_id,
+                nickname,
+                reels,
+                expires_at
+            )
+            VALUES ($1, $2, $3, $4::jsonb, $5)`,
             [
-                canonicalId,
-                score,
-                JSON.stringify({
-                    reels,
-                    multiplier: getRouletteMultiplier(reels),
-                    modifierDrop
-                })
-            ]
-        );
-
-        await client.query(
-            `INSERT INTO roulette_spins
-                (player_id, nickname, mode, score, jackpot, reels)
-             VALUES ($1, $2, 'solo', $3, $4, $5::jsonb)`,
-            [
+                sessionId,
                 canonicalId,
                 players.get(canonicalId).nickname,
-                score,
-                getRouletteJackpot(reels),
-                JSON.stringify(reels)
+                JSON.stringify(reels),
+                expiresAt
             ]
         );
 
+        // Запускаем кулдаун уже при начале вращения
         const newNextAt = now + ROULETTE_COOLDOWN;
 
         await client.query(
@@ -2154,12 +2193,13 @@ app.post('/api/roulette/solo', async (req, res) => {
         return res.json({
             success: true,
             mode: 'solo',
+            pending: true,
+            sessionId,
             reels,
-            score,
+            score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
-            modifierDrop,
-            balance: newBalance,
+            balance: Number(account.rows[0].balance),
             nextAt: newNextAt,
             cooldownMs: ROULETTE_COOLDOWN
         });
@@ -2177,6 +2217,401 @@ app.post('/api/roulette/solo', async (req, res) => {
             error: error.message === 'PLAYER_NOT_FOUND'
                 ? 'Player not found'
                 : 'Database temporarily unavailable'
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Переброс одного выбранного символа в соло-рулетке
+app.post('/api/roulette/solo/reroll', async (req, res) => {
+    const { playerId, sessionId, index } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) ||
+        !Number.isInteger(index) ||
+        index < 0 ||
+        index > 2
+    ) {
+        return res.status(400).json({
+            error: 'Invalid reroll data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Блокируем аккаунт игрока
+        const account = await client.query(
+            `SELECT player_id
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Блокируем незавершённое вращение
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_solo_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        if (session.status !== 'pending') {
+            throw new Error('SESSION_NOT_PENDING');
+        }
+
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+        
+            await client.query('COMMIT');
+        
+            return res.status(409).json({
+                error: 'Время вращения истекло'
+            });
+        }
+
+        if (session.reroll_used) {
+            throw new Error('REROLL_ALREADY_USED');
+        }
+
+        // Проверяем, что игрок разблокировал механику переброса
+        const unlocked = await client.query(
+            `SELECT id
+             FROM player_purchases
+             WHERE player_id = $1
+               AND item_code = 'roulette_unlock_pebble'`,
+            [canonicalId]
+        );
+
+        if (!unlocked.rowCount) {
+            throw new Error('REROLL_NOT_UNLOCKED');
+        }
+
+        // Проверяем наличие предмета и его экипировку
+        const modifier = await client.query(
+            `SELECT
+                pi.quantity,
+                pe.slot_type,
+                pe.slot_number
+             FROM player_inventory pi
+             JOIN player_equipment pe
+                ON pe.player_id = pi.player_id
+                AND pe.item_code = pi.item_code
+             JOIN inventory_items i
+                ON i.code = pi.item_code
+             WHERE pi.player_id = $1
+               AND pi.item_code = 'roulette_mod_reroll'
+               AND pi.quantity > 0
+               AND i.is_active = TRUE
+               AND pe.slot_type = 'roulette_modifier'
+             FOR UPDATE OF pi`,
+            [canonicalId]
+        );
+
+        if (!modifier.rowCount) {
+            throw new Error('REROLL_ITEM_NOT_EQUIPPED');
+        }
+
+        const reels = session.reels;
+
+        if (
+            !Array.isArray(reels) ||
+            reels.length !== 3 ||
+            !reels[index]
+        ) {
+            throw new Error('INVALID_SESSION_REELS');
+        }
+
+        // Генерируем новый символ для выбранной позиции
+        const previousItem = reels[index];
+        const newItem = getRouletteResource();
+
+        reels[index] = newItem;
+
+        // Списываем один экземпляр модификатора
+        const quantity = Number(modifier.rows[0].quantity);
+
+        if (quantity === 1) {
+            // Удаление предмета автоматически снимет его с экипировки
+            await client.query(
+                `DELETE FROM player_inventory
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_reroll'`,
+                [canonicalId]
+            );
+        } else {
+            await client.query(
+                `UPDATE player_inventory
+                 SET quantity = quantity - 1,
+                     updated_at = NOW()
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_reroll'`,
+                [canonicalId]
+            );
+        }
+
+        // Сохраняем обновлённый результат и отмечаем использование
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET reels = $2::jsonb,
+                 reroll_used = TRUE
+             WHERE id = $1`,
+            [sessionId, JSON.stringify(reels)]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            sessionId,
+            reels,
+            replacedIndex: index,
+            previousItem,
+            newItem,
+            score: getRouletteScore(reels),
+            multiplier: getRouletteMultiplier(reels),
+            jackpot: getRouletteJackpot(reels),
+            rerollUsed: true,
+            remainingQuantity: quantity - 1
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [404, 'Player not found'],
+            SESSION_NOT_FOUND: [404, 'Вращение не найдено'],
+            SESSION_NOT_PENDING: [409, 'Вращение уже завершено'],
+            SESSION_EXPIRED: [409, 'Время вращения истекло'],
+            REROLL_ALREADY_USED: [409, 'Переброс уже использован'],
+            REROLL_NOT_UNLOCKED: [403, 'Механика переброса не разблокирована'],
+            REROLL_ITEM_NOT_EQUIPPED: [403, 'Экипируйте модификатор «Переброс»'],
+            INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Solo roulette reroll failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Завершение соло-вращения и начисление награды
+app.post('/api/roulette/solo/complete', async (req, res) => {
+    const { playerId, sessionId } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)
+    ) {
+        return res.status(400).json({
+            error: 'Invalid completion data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Блокируем счёт игрока
+        const account = await client.query(
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Блокируем сессию, чтобы исключить повторное начисление
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_solo_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        if (session.status !== 'pending') {
+            throw new Error('SESSION_NOT_PENDING');
+        }
+
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(409).json({
+                error: 'Время вращения истекло'
+            });
+        }
+
+        const reels = session.reels;
+
+        if (!Array.isArray(reels) || reels.length !== 3) {
+            throw new Error('INVALID_SESSION_REELS');
+        }
+
+        // Рассчитываем окончательный результат
+        const score = getRouletteScore(reels);
+        const multiplier = getRouletteMultiplier(reels);
+        const jackpot = getRouletteJackpot(reels);
+
+        // Проверяем джекпот и выдаём модификатор
+        const modifierDrop = await grantRouletteJackpotModifier(
+            client,
+            canonicalId,
+            reels
+        );
+
+        // Начисляем очки
+        const newBalance = Number(account.rows[0].balance) + score;
+
+        await client.query(
+            `UPDATE roulette_accounts
+             SET balance = $2,
+                 updated_at = NOW()
+             WHERE player_id = $1`,
+            [canonicalId, newBalance]
+        );
+
+        // Записываем финансовую операцию
+        await client.query(
+            `INSERT INTO roulette_transactions
+                (player_id, type, amount, details)
+             VALUES ($1, 'solo_reward', $2, $3::jsonb)`,
+            [
+                canonicalId,
+                score,
+                JSON.stringify({
+                    sessionId,
+                    reels,
+                    multiplier,
+                    modifierDrop
+                })
+            ]
+        );
+
+        // Записываем результат в историю вращений
+        await client.query(
+            `INSERT INTO roulette_spins
+                (player_id, nickname, mode, score, jackpot, reels)
+             VALUES ($1, $2, 'solo', $3, $4, $5::jsonb)`,
+            [
+                canonicalId,
+                session.nickname,
+                score,
+                jackpot,
+                JSON.stringify(reels)
+            ]
+        );
+
+        // Закрываем сессию
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET status = 'completed',
+                 completed_at = NOW()
+             WHERE id = $1`,
+            [sessionId]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            mode: 'solo',
+            sessionId,
+            reels,
+            score,
+            multiplier,
+            jackpot,
+            modifierDrop,
+            balance: newBalance
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [404, 'Player not found'],
+            SESSION_NOT_FOUND: [404, 'Вращение не найдено'],
+            SESSION_NOT_PENDING: [409, 'Вращение уже завершено'],
+            INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Solo roulette completion failed:', error);
+
+        return res.status(status).json({
+            error: message
         });
 
     } finally {
@@ -4105,6 +4540,35 @@ async function initializeDatabase() {
         reels JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        -- Незавершённые соло-вращения
+        CREATE TABLE IF NOT EXISTS roulette_solo_sessions (
+            id UUID PRIMARY KEY,
+            player_id TEXT NOT NULL
+                REFERENCES roulette_accounts(player_id)
+                ON DELETE CASCADE,
+
+            nickname TEXT NOT NULL,
+            reels JSONB NOT NULL,
+
+            reroll_used BOOLEAN NOT NULL DEFAULT FALSE,
+
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'completed', 'expired')),
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            completed_at TIMESTAMPTZ
+        );
+
+        -- Не допускаем несколько незавершённых вращений одного игрока
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_solo_one_pending
+            ON roulette_solo_sessions (player_id)
+            WHERE status = 'pending';
+
+        -- Ускоряем поиск активных вращений игрока
+        CREATE INDEX IF NOT EXISTS idx_roulette_solo_player_status
+            ON roulette_solo_sessions (player_id, status);
         
         CREATE INDEX IF NOT EXISTS idx_roulette_spins_player
             ON roulette_spins (player_id);
