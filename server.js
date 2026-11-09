@@ -2108,6 +2108,7 @@ app.post('/api/roulette/solo', async (req, res) => {
                     success: true,
                     mode: 'solo',
                     pending: true,
+                    rerollUsed: Boolean(session.reroll_used),
                     sessionId: session.id,
                     reels: session.reels,
                     score: getRouletteScore(session.reels),
