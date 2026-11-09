@@ -2251,6 +2251,8 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
 
         client = await pool.connect();
         await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
 
         // Блокируем аккаунт игрока
         const account = await client.query(
@@ -2478,6 +2480,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
 
         client = await pool.connect();
         await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
 
         // Блокируем счёт игрока
         const account = await client.query(
