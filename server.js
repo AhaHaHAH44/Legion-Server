@@ -4621,6 +4621,9 @@ async function initializeDatabase() {
         -- Additive migrations for databases created by earlier 2.0.x builds.
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS completion_result JSONB;
+
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS reroll_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
