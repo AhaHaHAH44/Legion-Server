@@ -298,17 +298,17 @@ async function grantRouletteJackpotModifier(db, playerId, reels) {
         iron: {
             unlockCode: 'roulette_unlock_iron',
             itemCode: 'roulette_mod_lock',
-            name: 'Закрепление'
+            name: 'Повтор'
         },
         coal: {
             unlockCode: 'roulette_unlock_coal',
-            itemCode: 'roulette_mod_second_chance',
-            name: 'Вторая попытка'
+            itemCode: 'roulette_mod_duplicate',
+            name: 'Дублирование'
         },
         gold: {
             unlockCode: 'roulette_unlock_gold',
-            itemCode: 'roulette_mod_duplicate',
-            name: 'Дублирование'
+            itemCode: 'roulette_mod_second_chance',
+            name: 'Лихорадка'
         },
         topaz: {
             unlockCode: 'roulette_unlock_topaz',
@@ -5279,42 +5279,42 @@ async function initializeDatabase() {
             ),
             (
                 'roulette_mod_lock',
-                'Закрепление',
-                'Позволяет закрепить два выбранных символа и перебросить третий.',
+                'Повтор',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх железных символов.',
                 'roulette_modifier',
                 'uncommon',
-                '🔒',
+                '🔁',
                 TRUE,
                 99,
                 TRUE,
                 120,
-                '{"modifier_id":"lock","trigger":"iron_triple"}'::jsonb
-            ),
-            (
-                'roulette_mod_second_chance',
-                'Вторая попытка',
-                'Позволяет получить второй полный результат рулетки и выбрать один из двух.',
-                'roulette_modifier',
-                'rare',
-                '🎲',
-                TRUE,
-                99,
-                TRUE,
-                130,
-                '{"modifier_id":"second_chance","trigger":"coal_triple"}'::jsonb
+                '{"modifier_id":"repeat","trigger":"iron_triple"}'::jsonb
             ),
             (
                 'roulette_mod_duplicate',
                 'Дублирование',
-                'Позволяет скопировать один символ на другую позицию.',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх угольных символов.',
                 'roulette_modifier',
                 'rare',
                 '✨',
                 TRUE,
                 99,
                 TRUE,
+                130,
+                '{"modifier_id":"duplicate","trigger":"coal_triple"}'::jsonb
+            ),
+            (
+                'roulette_mod_second_chance',
+                'Лихорадка',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх золотых символов.',
+                'roulette_modifier',
+                'rare',
+                '🔥',
+                TRUE,
+                99,
+                TRUE,
                 140,
-                '{"modifier_id":"duplicate","trigger":"gold_triple"}'::jsonb
+                '{"modifier_id":"fever","trigger":"gold_triple"}'::jsonb
             ),
             (
                 'roulette_mod_transmutation',
@@ -5430,7 +5430,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_iron',
                 'Механика железа',
-                'Разблокирует получение модификатора «Закрепление» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Повтор» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 300,
                 TRUE,
@@ -5440,22 +5440,22 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_coal',
                 'Механика угля',
-                'Разблокирует получение модификатора «Вторая попытка» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 400,
                 TRUE,
                 '{"unlock_type":"roulette_modifier","trigger":"coal_triple"}'::jsonb,
-                'roulette_mod_second_chance'
+                'roulette_mod_duplicate'
             ),
             (
                 'roulette_unlock_gold',
                 'Механика золота',
-                'Разблокирует получение модификатора «Дублирование» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 500,
                 TRUE,
                 '{"unlock_type":"roulette_modifier","trigger":"gold_triple"}'::jsonb,
-                'roulette_mod_duplicate'
+                'roulette_mod_second_chance'
             ),
             (
                 'roulette_unlock_topaz',
@@ -5483,6 +5483,50 @@ async function initializeDatabase() {
                 description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите одну «Страховку» в подарок.',
                 inventory_item_code = 'roulette_mod_pair_save'
             WHERE code = 'roulette_unlock_limestone';
+
+            -- Обновление существующих модификаторов
+            UPDATE inventory_items
+            SET
+                name = 'Повтор',
+                description = 'Модификатор Кото-рулетки, получаемый за джекпот из трёх железных символов.',
+                icon = '🔁',
+                metadata = '{"modifier_id":"repeat","trigger":"iron_triple"}'::jsonb
+            WHERE code = 'roulette_mod_lock';
+            
+            UPDATE inventory_items
+            SET
+                name = 'Дублирование',
+                description = 'Модификатор Кото-рулетки, получаемый за джекпот из трёх угольных символов.',
+                icon = '✨',
+                metadata = '{"modifier_id":"duplicate","trigger":"coal_triple"}'::jsonb
+            WHERE code = 'roulette_mod_duplicate';
+            
+            UPDATE inventory_items
+            SET
+                name = 'Лихорадка',
+                description = 'Модификатор Кото-рулетки, получаемый за джекпот из трёх золотых символов.',
+                icon = '🔥',
+                metadata = '{"modifier_id":"fever","trigger":"gold_triple"}'::jsonb
+            WHERE code = 'roulette_mod_second_chance';
+            
+            -- Обновление существующих разблокировок магазина
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Повтор» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
+                inventory_item_code = 'roulette_mod_lock'
+            WHERE code = 'roulette_unlock_iron';
+            
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
+                inventory_item_code = 'roulette_mod_duplicate'
+            WHERE code = 'roulette_unlock_coal';
+            
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
+                inventory_item_code = 'roulette_mod_second_chance'
+            WHERE code = 'roulette_unlock_gold';
                         
     `);
     console.log('PostgreSQL schema is ready.');
