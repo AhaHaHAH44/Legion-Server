@@ -4562,7 +4562,7 @@ app.get('/api/shop/:playerId', async (req, res) => {
                 ON p.item_code = s.code
                 AND p.player_id = $1
              WHERE s.is_active = TRUE
-             ORDER BY s.created_at ASC`,
+             ORDER BY s.price ASC, s.name ASC, s.code ASC`,
             [playerId]
         );
 
