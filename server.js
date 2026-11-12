@@ -293,7 +293,7 @@ async function grantRouletteJackpotModifier(db, playerId, reels) {
         limestone: {
             unlockCode: 'roulette_unlock_limestone',
             itemCode: 'roulette_mod_pair_save',
-            name: 'Сохранение пары'
+            name: 'Страховка'
         },
         iron: {
             unlockCode: 'roulette_unlock_iron',
@@ -2109,6 +2109,7 @@ app.post('/api/roulette/solo', async (req, res) => {
                     mode: 'solo',
                     pending: true,
                     rerollUsed: Boolean(session.reroll_used),
+                    insuranceUsed: Boolean(session.insurance_used),
                     sessionId: session.id,
                     reels: session.reels,
                     score: getRouletteScore(session.reels),
@@ -2447,6 +2448,248 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
         ];
 
         console.error('Solo roulette reroll failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Страховка: сохранить один символ и перебросить два остальных
+app.post('/api/roulette/solo/insurance', async (req, res) => {
+    const { playerId, sessionId, keepIndex } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) ||
+        !Number.isInteger(keepIndex) ||
+        keepIndex < 0 ||
+        keepIndex > 2
+    ) {
+        return res.status(400).json({
+            error: 'Invalid insurance data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
+
+        // Блокируем аккаунт игрока
+        const account = await client.query(
+            `SELECT player_id
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Блокируем незавершённое вращение
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_solo_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        // Уже завершённое вращение нельзя изменить
+        if (session.status === 'completed') {
+            if (session.completion_result) {
+                const savedResult =
+                    typeof session.completion_result === 'string'
+                        ? JSON.parse(session.completion_result)
+                        : session.completion_result;
+
+                await client.query('COMMIT');
+
+                return res.json({
+                    ...savedResult,
+                    alreadyCompleted: true
+                });
+            }
+
+            throw new Error('SESSION_NOT_PENDING');
+        }
+
+        if (session.status !== 'pending') {
+            throw new Error('SESSION_NOT_PENDING');
+        }
+
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(409).json({
+                error: 'Время вращения истекло'
+            });
+        }
+
+        // Проверяем, использовалась ли уже Страховка
+        if (session.insurance_used) {
+            throw new Error('INSURANCE_ALREADY_USED');
+        }
+
+        // Проверяем разблокировку механики
+        const unlocked = await client.query(
+            `SELECT id
+             FROM player_purchases
+             WHERE player_id = $1
+               AND item_code = 'roulette_unlock_limestone'`,
+            [canonicalId]
+        );
+
+        if (!unlocked.rowCount) {
+            throw new Error('INSURANCE_NOT_UNLOCKED');
+        }
+
+        // Проверяем наличие и экипировку Страховки
+        const modifier = await client.query(
+            `SELECT pi.quantity
+             FROM player_inventory pi
+             JOIN player_equipment pe
+                ON pe.player_id = pi.player_id
+                AND pe.item_code = pi.item_code
+             JOIN inventory_items i
+                ON i.code = pi.item_code
+             WHERE pi.player_id = $1
+               AND pi.item_code = 'roulette_mod_pair_save'
+               AND pi.quantity > 0
+               AND i.is_active = TRUE
+               AND pe.slot_type = 'roulette_modifier'
+             FOR UPDATE OF pi`,
+            [canonicalId]
+        );
+
+        if (!modifier.rowCount) {
+            throw new Error('INSURANCE_ITEM_NOT_EQUIPPED');
+        }
+
+        const reels = session.reels;
+
+        if (
+            !Array.isArray(reels) ||
+            reels.length !== 3 ||
+            !reels[keepIndex]
+        ) {
+            throw new Error('INVALID_SESSION_REELS');
+        }
+
+        // Сохраняем выбранный символ, два других перебрасываем
+        const keptItem = reels[keepIndex];
+        const replacedItems = [];
+
+        for (let index = 0; index < 3; index++) {
+            if (index === keepIndex) continue;
+
+            const previousItem = reels[index];
+            const newItem = getRouletteResource();
+
+            reels[index] = newItem;
+
+            replacedItems.push({
+                index,
+                previousItem,
+                newItem
+            });
+        }
+
+        // Списываем одну Страховку
+        const quantity = Number(modifier.rows[0].quantity);
+
+        if (quantity === 1) {
+            await client.query(
+                `DELETE FROM player_inventory
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_pair_save'`,
+                [canonicalId]
+            );
+        } else {
+            await client.query(
+                `UPDATE player_inventory
+                 SET quantity = quantity - 1,
+                     updated_at = NOW()
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_pair_save'`,
+                [canonicalId]
+            );
+        }
+
+        // Сохраняем результат и отмечаем использование Страховки
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET reels = $2::jsonb,
+                 insurance_used = TRUE
+             WHERE id = $1`,
+            [sessionId, JSON.stringify(reels)]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            sessionId,
+            reels,
+            keptIndex: keepIndex,
+            keptItem,
+            replacedItems,
+            score: getRouletteScore(reels),
+            multiplier: getRouletteMultiplier(reels),
+            jackpot: getRouletteJackpot(reels),
+            insuranceUsed: true,
+            remainingQuantity: quantity - 1
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [404, 'Player not found'],
+            SESSION_NOT_FOUND: [404, 'Вращение не найдено'],
+            SESSION_NOT_PENDING: [409, 'Вращение уже завершено'],
+            INSURANCE_ALREADY_USED: [409, 'Страховка уже использована'],
+            INSURANCE_NOT_UNLOCKED: [403, 'Механика Страховки не разблокирована'],
+            INSURANCE_ITEM_NOT_EQUIPPED: [403, 'Экипируйте модификатор «Страховка»'],
+            INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Solo roulette insurance failed:', error);
 
         return res.status(status).json({
             error: message
@@ -4598,6 +4841,7 @@ async function initializeDatabase() {
             reels JSONB NOT NULL,
 
             reroll_used BOOLEAN NOT NULL DEFAULT FALSE,
+            insurance_used BOOLEAN NOT NULL DEFAULT FALSE,
 
             status TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'completed', 'expired')),
@@ -4629,6 +4873,8 @@ async function initializeDatabase() {
 
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS reroll_used BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS insurance_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
@@ -5020,8 +5266,8 @@ async function initializeDatabase() {
             ),
             (
                 'roulette_mod_pair_save',
-                'Сохранение пары',
-                'Позволяет сохранить два одинаковых символа и перебросить третий.',
+                'Страховка',
+                'Позволяет выбрать один символ, который останется на месте, а два остальных будут переброшены.',
                 'roulette_modifier',
                 'uncommon',
                 '🛡️',
@@ -5029,7 +5275,7 @@ async function initializeDatabase() {
                 99,
                 TRUE,
                 110,
-                '{"modifier_id":"pair_save","trigger":"limestone_triple"}'::jsonb
+                '{"modifier_id":"insurance","trigger":"limestone_triple"}'::jsonb
             ),
             (
                 'roulette_mod_lock',
@@ -5174,7 +5420,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_limestone',
                 'Механика известняка',
-                'Разблокирует получение модификатора «Сохранение пары» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите одну «Страховку» в подарок.',
                 'unlock',
                 200,
                 TRUE,
@@ -5222,7 +5468,22 @@ async function initializeDatabase() {
                 'roulette_mod_transmutation'
             )
             ON CONFLICT (code) DO NOTHING;
+
+            -- Обновление уже существующего модификатора «Страховка»
+            UPDATE inventory_items
+            SET
+                name = 'Страховка',
+                description = 'Позволяет выбрать один символ, который останется на месте, а два остальных будут переброшены.',
+                metadata = '{"modifier_id":"insurance","trigger":"limestone_triple"}'::jsonb
+            WHERE code = 'roulette_mod_pair_save';
             
+            -- Обновление описания разблокировки в магазине
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите одну «Страховку» в подарок.',
+                inventory_item_code = 'roulette_mod_pair_save'
+            WHERE code = 'roulette_unlock_limestone';
+                        
     `);
     console.log('PostgreSQL schema is ready.');
 }
