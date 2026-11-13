@@ -5527,6 +5527,29 @@ async function initializeDatabase() {
                 description = 'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
                 inventory_item_code = 'roulette_mod_second_chance'
             WHERE code = 'roulette_unlock_gold';
+
+            // ========================================
+            // ПОДКАТЕГОРИИ МАГАЗИНА
+            // ========================================
+            
+            // Модификаторы Кото-рулетки
+            UPDATE shop_items
+            SET metadata = COALESCE(metadata, '{}'::jsonb)
+                || '{"subcategory": "jackpots"}'::jsonb
+            WHERE code IN (
+                'roulette_unlock_pebble',
+                'roulette_unlock_limestone',
+                'roulette_unlock_iron',
+                'roulette_unlock_coal',
+                'roulette_unlock_gold',
+                'roulette_unlock_topaz'
+            );
+            
+            // Игровые режимы
+            UPDATE shop_items
+            SET metadata = COALESCE(metadata, '{}'::jsonb)
+                || '{"subcategory": "modes"}'::jsonb
+            WHERE code = 'knb_betting';
                         
     `);
     console.log('PostgreSQL schema is ready.');
