@@ -4168,12 +4168,41 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
              [playerId]
          );
 
-         return res.json({
-             success: true,
-             playerId,
-             items: items.rows,
-             slots: slots.rows
-         });
+        // Получаем состояние четырёх ячеек модификаторов
+        const modifierSlots = await pool.query(
+            `SELECT
+                slot_numbers.slot_number,
+                (p.id IS NOT NULL) AS unlocked,
+                e.item_code,
+                i.name AS item_name,
+                i.icon AS item_icon,
+                i.rarity AS item_rarity
+             FROM generate_series(1, 4) AS slot_numbers(slot_number)
+             LEFT JOIN player_purchases p
+                ON p.player_id = $1
+                AND p.item_code =
+                    'roulette_modifier_slot_' || slot_numbers.slot_number
+             LEFT JOIN inventory_slots s
+                ON s.player_id = $1
+                AND s.slot_type = 'roulette_modifier'
+                AND s.slot_number = slot_numbers.slot_number
+             LEFT JOIN player_equipment e
+                ON e.player_id = s.player_id
+                AND e.slot_type = s.slot_type
+                AND e.slot_number = s.slot_number
+             LEFT JOIN inventory_items i
+                ON i.code = e.item_code
+             ORDER BY slot_numbers.slot_number`,
+            [playerId]
+        );
+
+        return res.json({
+            success: true,
+            playerId,
+            items: items.rows,
+            slots: slots.rows,
+            modifierSlots: modifierSlots.rows
+        });
 
      } catch (error) {
          console.error('Player inventory retrieval failed:', error);
@@ -4246,13 +4275,31 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
              [canonicalId, slotType, slotNumber]
          );
 
-         if (!slot.rowCount) {
-             throw new Error('SLOT_NOT_FOUND');
-         }
-
-         if (slot.rows[0].item_code !== null) {
-             throw new Error('SLOT_OCCUPIED');
-         }
+        if (!slot.rowCount) {
+            throw new Error('SLOT_NOT_FOUND');
+        }
+        
+        // Для ячеек модификаторов обязательно проверяем покупку
+        if (slotType === 'roulette_modifier') {
+            const purchase = await client.query(
+                `SELECT id
+                 FROM player_purchases
+                 WHERE player_id = $1
+                   AND item_code = $2`,
+                [
+                    canonicalId,
+                    `roulette_modifier_slot_${slotNumber}`
+                ]
+            );
+        
+            if (!purchase.rowCount) {
+                throw new Error('SLOT_LOCKED');
+            }
+        }
+        
+        if (slot.rows[0].item_code !== null) {
+            throw new Error('SLOT_OCCUPIED');
+        }
 
          // Проверяем владение предметом и совместимость категории
          const item = await client.query(
@@ -4311,6 +4358,7 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
              PLAYER_NOT_FOUND: [404, 'Player not found'],
              SLOT_NOT_FOUND: [404, 'Slot not found'],
              SLOT_OCCUPIED: [409, 'Slot is already occupied'],
+             SLOT_LOCKED: [403, 'This modifier slot is locked'],
              ITEM_NOT_OWNED: [403, 'You do not own this item'],
              CATEGORY_MISMATCH: [400, 'Item category is not accepted by this slot']
          };
@@ -4673,7 +4721,8 @@ app.post('/api/shop/purchase', async (req, res) => {
                 name,
                 price,
                 category,
-                inventory_item_code
+                inventory_item_code,
+                metadata
              FROM shop_items
              WHERE code = $1
                AND is_active = TRUE`,
@@ -4685,6 +4734,35 @@ app.post('/api/shop/purchase', async (req, res) => {
         }
 
         const product = item.rows[0];
+        // Проверяем последовательность покупки ячеек модификаторов
+        if (product.metadata?.slot_type === 'roulette_modifier') {
+            const slotNumber = Number(product.metadata.slot_number);
+
+            if (
+                !Number.isInteger(slotNumber) ||
+                slotNumber < 1 ||
+                slotNumber > 4
+            ) {
+                throw new Error('INVALID_SLOT_PRODUCT');
+            }
+
+            if (slotNumber > 1) {
+                const previousSlot = await client.query(
+                    `SELECT id
+                     FROM player_purchases
+                     WHERE player_id = $1
+                       AND item_code = $2`,
+                    [
+                        canonicalId,
+                        `roulette_modifier_slot_${slotNumber - 1}`
+                    ]
+                );
+
+                if (!previousSlot.rowCount) {
+                    throw new Error('PREVIOUS_SLOT_REQUIRED');
+                }
+            }
+        }
         const price = Number(product.price);
         const balance = Number(account.rows[0].balance);
 
@@ -4727,6 +4805,28 @@ app.post('/api/shop/purchase', async (req, res) => {
              VALUES ($1, $2, $3)`,
             [canonicalId, itemCode, price]
         );
+
+        // Открываем купленную ячейку модификаторов
+        if (product.metadata?.slot_type === 'roulette_modifier') {
+            await client.query(
+                `INSERT INTO inventory_slots (
+                    player_id,
+                    slot_type,
+                    slot_number
+                )
+                VALUES ($1, $2, $3)
+                ON CONFLICT (
+                    player_id,
+                    slot_type,
+                    slot_number
+                ) DO NOTHING`,
+                [
+                    canonicalId,
+                    product.metadata.slot_type,
+                    Number(product.metadata.slot_number)
+                ]
+            );
+        }
 
         // Если товар связан с предметом инвентаря,
         // выдаём его игроку в рамках текущей транзакции
@@ -4786,6 +4886,8 @@ app.post('/api/shop/purchase', async (req, res) => {
             PLAYER_NOT_FOUND: [404, 'Player not found'],
             ITEM_NOT_FOUND: [404, 'Товар не найден или больше недоступен'],
             ALREADY_OWNED: [409, 'Этот товар уже куплен'],
+            PREVIOUS_SLOT_REQUIRED: [409, 'Сначала необходимо открыть предыдущую ячейку'],
+            INVALID_SLOT_PRODUCT: [400, 'Некорректный товар ячейки'],
             INSUFFICIENT_BALANCE: [409, 'Недостаточно мяукоинов'],
             INVALID_ITEM_GRANT: [400, 'Invalid item grant'],
             INVENTORY_ITEM_NOT_FOUND: [404, 'Предмет инвентаря не найден'],
@@ -5179,7 +5281,7 @@ async function initializeDatabase() {
             -- DEFAULT INVENTORY SLOT TYPES
             -- ========================================
             
-            -- Два слота для модификаторов рулетки
+            -- Ячейки модификаторов рулетки открываются отдельно через магазин
             INSERT INTO inventory_slot_types (
                 slot_type,
                 name,
@@ -5191,10 +5293,15 @@ async function initializeDatabase() {
                 'roulette_modifier',
                 'Модификаторы рулетки',
                 ARRAY['roulette_modifier'],
-                2,
+                0,
                 1
             )
-            ON CONFLICT (slot_type) DO NOTHING;
+            ON CONFLICT (slot_type) DO UPDATE
+            SET
+                name = EXCLUDED.name,
+                accepted_categories = EXCLUDED.accepted_categories,
+                default_slots = 0,
+                is_active = TRUE;
             
             
             -- Один слот для косметических предметов
@@ -5520,6 +5627,55 @@ async function initializeDatabase() {
             )
             ON CONFLICT (code) DO NOTHING;
 
+             -- Ячейки для экипировки модификаторов Кото-рулетки
+            INSERT INTO shop_items (
+                code,
+                name,
+                description,
+                category,
+                price,
+                is_active,
+                metadata
+            )
+            VALUES
+            (
+                'roulette_modifier_slot_1',
+                'Первая ячейка модификаторов',
+                'Открывает первую ячейку для экипировки модификаторов Кото-рулетки.',
+                'unlock',
+                400,
+                TRUE,
+                '{"subcategory":"Ячейки","slot_type":"roulette_modifier","slot_number":1}'::jsonb
+            ),
+            (
+                'roulette_modifier_slot_2',
+                'Вторая ячейка модификаторов',
+                'Открывает вторую ячейку для экипировки модификаторов Кото-рулетки.',
+                'unlock',
+                800,
+                TRUE,
+                '{"subcategory":"Ячейки","slot_type":"roulette_modifier","slot_number":2}'::jsonb
+            ),
+            (
+                'roulette_modifier_slot_3',
+                'Третья ячейка модификаторов',
+                'Открывает третью ячейку для экипировки модификаторов Кото-рулетки.',
+                'unlock',
+                1600,
+                TRUE,
+                '{"subcategory":"Ячейки","slot_type":"roulette_modifier","slot_number":3}'::jsonb
+            ),
+            (
+                'roulette_modifier_slot_4',
+                'Четвёртая ячейка модификаторов',
+                'Открывает четвёртую ячейку для экипировки модификаторов Кото-рулетки.',
+                'unlock',
+                3200,
+                TRUE,
+                '{"subcategory":"Ячейки","slot_type":"roulette_modifier","slot_number":4}'::jsonb
+            )
+            ON CONFLICT (code) DO NOTHING;
+
             -- Обновление уже существующего модификатора «Страховка»
             UPDATE inventory_items
             SET
@@ -5603,6 +5759,19 @@ async function initializeDatabase() {
             WHERE code = 'knb_betting';
                         
     `);
+    // Удаляем бесплатные ячейки модификаторов, не подтверждённые покупкой
+    await pool.query(`
+        DELETE FROM inventory_slots s
+        WHERE s.slot_type = 'roulette_modifier'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM player_purchases p
+              WHERE p.player_id = s.player_id
+                AND p.item_code =
+                    'roulette_modifier_slot_' || s.slot_number
+          );
+    `);
+    
     console.log('PostgreSQL schema is ready.');
 }
 
