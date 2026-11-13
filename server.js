@@ -5528,11 +5528,11 @@ async function initializeDatabase() {
                 inventory_item_code = 'roulette_mod_second_chance'
             WHERE code = 'roulette_unlock_gold';
 
-            // ========================================
-            // ПОДКАТЕГОРИИ МАГАЗИНА
-            // ========================================
+            -- ========================================
+            -- ПОДКАТЕГОРИИ МАГАЗИНА
+            -- ========================================
             
-            // Модификаторы Кото-рулетки
+            -- Модификаторы Кото-рулетки
             UPDATE shop_items
             SET metadata = COALESCE(metadata, '{}'::jsonb)
                 || '{"subcategory": "jackpots"}'::jsonb
@@ -5545,7 +5545,7 @@ async function initializeDatabase() {
                 'roulette_unlock_topaz'
             );
             
-            // Игровые режимы
+            -- Игровые режимы
             UPDATE shop_items
             SET metadata = COALESCE(metadata, '{}'::jsonb)
                 || '{"subcategory": "modes"}'::jsonb
