@@ -292,8 +292,17 @@ function spinRoulette() {
 
 function getRouletteMultiplier(reels) {
     const counts = new Map();
-    for (const item of reels) counts.set(item.id, (counts.get(item.id) || 0) + 1);
-    const highestCount = counts.size ? Math.max(...counts.values()) : 0;
+
+    for (const item of reels) {
+        if (item.id === 'empty') continue;
+
+        counts.set(item.id, (counts.get(item.id) || 0) + 1);
+    }
+
+    const highestCount = counts.size
+        ? Math.max(...counts.values())
+        : 0;
+
     return highestCount === 3 ? 2 : highestCount === 2 ? 1.5 : 1;
 }
 
@@ -303,7 +312,99 @@ function getRouletteScore(reels) {
 }
 
 function getRouletteJackpot(reels) {
-    return reels.length === 3 && reels.every(item => item.id === reels[0].id);
+    return reels.length === 3 &&
+        reels.every(item =>
+            item.id !== 'empty' &&
+            item.id === reels[0].id
+        );
+}
+
+// Получаем количество экипированных модификаторов рулетки
+async function getEquippedRouletteModifierCount(db, playerId) {
+    const result = await db.query(
+        `SELECT COUNT(*)::INTEGER AS count
+         FROM player_equipment
+         WHERE player_id = $1
+           AND slot_type = 'roulette_modifier'
+           AND item_code IN (
+               'roulette_mod_reroll',
+               'roulette_mod_pair_save',
+               'roulette_mod_lock',
+               'roulette_mod_duplicate',
+               'roulette_mod_second_chance',
+               'roulette_mod_transmutation'
+           )`,
+        [playerId]
+    );
+
+    return Number(result.rows[0]?.count || 0);
+}
+
+// Рассчитываем эффекты «Кошачьей расплаты» для нового соло-вращения
+async function applyCatReckoning(db, playerId, reels) {
+    const modifierCount = await getEquippedRouletteModifierCount(
+        db,
+        playerId
+    );
+
+    const effects = {
+        modifierCount,
+        rejectModifierDrop: false,
+        emptyIndices: [],
+        doubleCooldown: false
+    };
+
+    // 2 модификатора: 20% шанс отклонить выпадение награды
+    if (modifierCount >= 2) {
+        effects.rejectModifierDrop = crypto.randomInt(100) < 20;
+    }
+
+    // 3 модификатора: 5% шанс пустой ячейки для каждого символа
+    if (modifierCount >= 3) {
+        for (let i = 0; i < reels.length; i++) {
+            if (crypto.randomInt(100) < 5) {
+                effects.emptyIndices.push(i);
+
+                reels[i] = {
+                    id: 'empty',
+                    name: 'Пусто',
+                    emoji: '▫️',
+                    points: 0
+                };
+            }
+        }
+    }
+
+    // 4 модификатора: 50% шанс удвоить следующий кулдаун
+    if (modifierCount >= 4) {
+        effects.doubleCooldown = crypto.randomInt(100) < 50;
+    }
+
+    return effects;
+}
+
+// Генерируем новый символ с учётом 5% шанса пустой ячейки
+async function getCatReckoningResource(db, playerId) {
+    const modifierCount = await getEquippedRouletteModifierCount(
+        db,
+        playerId
+    );
+
+    // При 3 и более экипированных модификаторах
+    // каждый новый символ имеет 5% шанс стать пустым
+    if (
+        modifierCount >= 3 &&
+        crypto.randomInt(100) < 5
+    ) {
+        return {
+            id: 'empty',
+            name: 'Пусто',
+            emoji: '▫️',
+            points: 0
+        };
+    }
+
+    return getRouletteResource();
 }
 
 // ========================================
@@ -2145,6 +2246,7 @@ app.post('/api/roulette/solo', async (req, res) => {
                     insuranceUsed: Boolean(session.insurance_used),
                     sessionId: session.id,
                     reels: session.reels,
+                    catReckoning: session.cat_reckoning || {},
                     score: getRouletteScore(session.reels),
                     multiplier: getRouletteMultiplier(session.reels),
                     jackpot: getRouletteJackpot(session.reels),
@@ -2189,6 +2291,14 @@ app.post('/api/roulette/solo', async (req, res) => {
 
         // Генерируем предварительный результат
         const reels = spinRoulette();
+        
+        // Применяем эффекты «Кошачьей расплаты»
+        const catReckoning = await applyCatReckoning(
+            client,
+            canonicalId,
+            reels
+        );
+        
         const sessionId = crypto.randomUUID();
 
         // Сохраняем вращение на 30 минут
@@ -2200,20 +2310,25 @@ app.post('/api/roulette/solo', async (req, res) => {
                 player_id,
                 nickname,
                 reels,
+                cat_reckoning,
                 expires_at
             )
-            VALUES ($1, $2, $3, $4::jsonb, $5)`,
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6)`,
             [
                 sessionId,
                 canonicalId,
                 players.get(canonicalId).nickname,
                 JSON.stringify(reels),
+                JSON.stringify(catReckoning),
                 expiresAt
             ]
         );
 
-        // Запускаем кулдаун уже при начале вращения
-        const newNextAt = now + ROULETTE_COOLDOWN;
+        // Запускаем кулдаун с учётом «Кошачьей расплаты»
+        const cooldownDuration = ROULETTE_COOLDOWN *
+            (catReckoning.doubleCooldown ? 2 : 1);
+        
+        const newNextAt = now + cooldownDuration;
 
         await client.query(
             `INSERT INTO roulette_cooldowns (player_id, next_at)
@@ -2231,12 +2346,13 @@ app.post('/api/roulette/solo', async (req, res) => {
             pending: true,
             sessionId,
             reels,
+            catReckoning,
             score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
             balance: Number(account.rows[0].balance),
             nextAt: newNextAt,
-            cooldownMs: ROULETTE_COOLDOWN
+            cooldownMs: cooldownDuration
         });
 
     } catch (error) {
@@ -2406,10 +2522,13 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
             throw new Error('INVALID_SESSION_REELS');
         }
 
-        // Генерируем новый символ для выбранной позиции
+        // Генерируем новый символ с учётом «Кошачьей расплаты»
         const previousItem = reels[index];
-        const newItem = getRouletteResource();
-
+        const newItem = await getCatReckoningResource(
+            client,
+            canonicalId
+        );
+        
         reels[index] = newItem;
 
         // Списываем один экземпляр модификатора
@@ -2645,8 +2764,11 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
             if (index === keepIndex) continue;
 
             const previousItem = reels[index];
-            const newItem = getRouletteResource();
-
+            const newItem = await getCatReckoningResource(
+                client,
+                canonicalId
+            );
+            
             reels[index] = newItem;
 
             replacedItems.push({
@@ -2836,12 +2958,26 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         const multiplier = getRouletteMultiplier(reels);
         const jackpot = getRouletteJackpot(reels);
 
-        // Проверяем джекпот и выдаём модификатор
-        const modifierDrop = await grantRouletteJackpotModifier(
-            client,
-            canonicalId,
-            reels
-        );
+        // Проверяем джекпот и учитываем «Кошачью расплату»
+        let modifierDrop;
+        
+        const catReckoning = session.cat_reckoning || {};
+        
+        if (catReckoning.rejectModifierDrop) {
+            // Кошачья расплата отклонила выпадение награды
+            modifierDrop = {
+                granted: false,
+                rejected: true,
+                reason: 'cat_reckoning'
+            };
+        } else {
+            // Обычная выдача модификатора за джекпот
+            modifierDrop = await grantRouletteJackpotModifier(
+                client,
+                canonicalId,
+                reels
+            );
+        }
 
         // Начисляем очки
         const newBalance = Number(account.rows[0].balance) + score;
@@ -5028,6 +5164,8 @@ async function initializeDatabase() {
         ADD COLUMN IF NOT EXISTS reroll_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS insurance_used BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS cat_reckoning JSONB NOT NULL DEFAULT '{}'::jsonb;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
