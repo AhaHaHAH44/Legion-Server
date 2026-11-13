@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { Server } = require('socket.io');
 
 if (!process.env.DATABASE_URL) {
     console.error('DATABASE_URL is missing. Configure it in Render Environment.');
@@ -18,6 +19,30 @@ const pool = new Pool({
 
 const app = express();
 const server = http.createServer(app);
+
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    }
+});
+
+// Комнаты подключённых игроков
+io.on('connection', (socket) => {
+    socket.on('inventory:subscribe', async (playerId) => {
+        if (typeof playerId !== 'string' || !playerId.trim()) {
+            return;
+        }
+
+        try {
+            const canonicalId = await resolvePlayerId(playerId);
+
+            socket.join(`inventory:${canonicalId}`);
+        } catch (error) {
+            console.error('Inventory subscription failed:', error);
+        }
+    });
+});
 
 app.use(express.json({ limit: '10kb' }));
 
@@ -183,6 +208,14 @@ async function grantInventoryItem(db, playerId, itemCode, quantity = 1) {
         quantity,
         added: quantity
     };
+}
+
+// Уведомить игрока об изменении инвентаря
+function notifyInventoryUpdated(playerId, itemCode, quantity) {
+    io.to(`inventory:${playerId}`).emit('inventory:updated', {
+        itemCode,
+        quantity
+    });
 }
 
 function cleanup() {
@@ -2878,6 +2911,14 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         
         await client.query('COMMIT');
 
+        if (modifierDrop?.granted) {
+            notifyInventoryUpdated(
+                canonicalId,
+                modifierDrop.code,
+                1
+            );
+        }
+        
         return res.json(completionResult);
 
     } catch (error) {
@@ -4483,6 +4524,8 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
 
          await client.query('COMMIT');
 
+         notifyInventoryUpdated(canonicalId, itemCode, quantity);
+
          console.log(
              `Inventory item granted: ${itemCode} x${quantity} -> ${canonicalId}`
          );
@@ -4713,7 +4756,15 @@ app.post('/api/shop/purchase', async (req, res) => {
         );
 
         await client.query('COMMIT');
-
+        
+        if (product.inventory_item_code) {
+            notifyInventoryUpdated(
+                canonicalId,
+                product.inventory_item_code,
+                1
+            );
+        }
+        
         return res.json({
             success: true,
             message: 'Purchase successful',
