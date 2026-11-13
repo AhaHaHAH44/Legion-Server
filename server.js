@@ -383,17 +383,12 @@ async function applyCatReckoning(db, playerId, reels) {
     return effects;
 }
 
-// Генерируем новый символ с учётом 5% шанса пустой ячейки
-async function getCatReckoningResource(db, playerId) {
-    const modifierCount = await getEquippedRouletteModifierCount(
-        db,
-        playerId
-    );
-
-    // При 3 и более экипированных модификаторах
+// Генерируем новый символ с учётом уровня проклятия текущей сессии
+async function getCatReckoningResource(modifierCount) {
+    // При 3 и более модификаторах
     // каждый новый символ имеет 5% шанс стать пустым
     if (
-        modifierCount >= 3 &&
+        Number(modifierCount) >= 3 &&
         crypto.randomInt(100) < 5
     ) {
         return {
@@ -2324,20 +2319,6 @@ app.post('/api/roulette/solo', async (req, res) => {
             ]
         );
 
-        // Запускаем кулдаун с учётом «Кошачьей расплаты»
-        const cooldownDuration = ROULETTE_COOLDOWN *
-            (catReckoning.doubleCooldown ? 2 : 1);
-        
-        const newNextAt = now + cooldownDuration;
-
-        await client.query(
-            `INSERT INTO roulette_cooldowns (player_id, next_at)
-             VALUES ($1, $2)
-             ON CONFLICT (player_id)
-             DO UPDATE SET next_at = EXCLUDED.next_at`,
-            [canonicalId, newNextAt]
-        );
-
         await client.query('COMMIT');
 
         return res.json({
@@ -2351,8 +2332,8 @@ app.post('/api/roulette/solo', async (req, res) => {
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
             balance: Number(account.rows[0].balance),
-            nextAt: newNextAt,
-            cooldownMs: cooldownDuration
+            nextAt: 0,
+            cooldownMs: 0
         });
 
     } catch (error) {
@@ -2525,8 +2506,7 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
         // Генерируем новый символ с учётом «Кошачьей расплаты»
         const previousItem = reels[index];
         const newItem = await getCatReckoningResource(
-            client,
-            canonicalId
+            session.cat_reckoning?.modifierCount ?? 0
         );
         
         reels[index] = newItem;
@@ -2765,8 +2745,7 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
 
             const previousItem = reels[index];
             const newItem = await getCatReckoningResource(
-                client,
-                canonicalId
+                session.cat_reckoning?.modifierCount ?? 0
             );
             
             reels[index] = newItem;
@@ -3021,6 +3000,22 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             ]
         );
 
+        // Запускаем кулдаун только после получения награды
+        // Используем результат проверки, сохранённый в сессии
+        const cooldownDuration = ROULETTE_COOLDOWN *
+            (catReckoning.doubleCooldown ? 2 : 1);
+        
+        const completedAt = Date.now();
+        const nextAt = completedAt + cooldownDuration;
+        
+        await client.query(
+            `INSERT INTO roulette_cooldowns (player_id, next_at)
+             VALUES ($1, $2)
+             ON CONFLICT (player_id)
+             DO UPDATE SET next_at = EXCLUDED.next_at`,
+            [canonicalId, nextAt]
+        );
+
         // Закрываем сессию
         // Формируем результат вращения
         const completionResult = {
@@ -3032,7 +3027,9 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             multiplier,
             jackpot,
             modifierDrop,
-            balance: newBalance
+            balance: newBalance,
+            nextAt,
+            cooldownMs: cooldownDuration
         };
         
         // Закрываем сессию и сохраняем результат
