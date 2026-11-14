@@ -4720,6 +4720,7 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
                 (p.id IS NOT NULL) AS unlocked,
                 e.item_code,
                 e.lock_remaining_games,
+                e.lock_reel_index,
                 i.name AS item_name,
                 i.icon AS item_icon,
                 i.rarity AS item_rarity
