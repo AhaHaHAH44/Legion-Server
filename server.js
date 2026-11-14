@@ -3348,8 +3348,6 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
                 lockConsumed = true;
             }
         }
-
-        const completionResult = {
         
         const completionResult = {
             success: true,
