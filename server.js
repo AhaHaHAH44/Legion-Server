@@ -2293,6 +2293,40 @@ app.post('/api/roulette/solo', async (req, res) => {
             canonicalId,
             reels
         );
+
+        // Применяем активное «Закрепление»
+        const lockResult = await client.query(
+            `SELECT lock_reel_index, lock_reel_item
+             FROM player_equipment
+             WHERE player_id = $1
+               AND item_code = 'roulette_mod_lock'
+               AND slot_type = 'roulette_modifier'
+               AND lock_remaining_games > 0
+             FOR UPDATE`,
+            [canonicalId]
+        );
+        
+        if (lockResult.rowCount > 0) {
+            const lockIndex = Number(lockResult.rows[0].lock_reel_index);
+        
+            const lockItem = typeof lockResult.rows[0].lock_reel_item === 'string'
+                ? JSON.parse(lockResult.rows[0].lock_reel_item)
+                : lockResult.rows[0].lock_reel_item;
+        
+            // Проверяем сохранённые данные перед применением
+            if (
+                !Number.isInteger(lockIndex) ||
+                lockIndex < 0 ||
+                lockIndex > 2 ||
+                !lockItem ||
+                typeof lockItem.id !== 'string'
+            ) {
+                throw new Error('INVALID_LOCK_DATA');
+            }
+        
+            // Возвращаем сохранённый символ на его прежнюю позицию
+            reels[lockIndex] = lockItem;
+        }
         
         const sessionId = crypto.randomUUID();
 
@@ -3286,6 +3320,7 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         
             // После третьей завершённой игры расходуем модификатор
             if (remainingGames === 0) {
+                // Проверяем наличие предмета в инвентаре
                 const inventoryItem = await client.query(
                     `SELECT quantity
                      FROM player_inventory
@@ -3294,42 +3329,54 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
                      FOR UPDATE`,
                     [canonicalId]
                 );
-        
-                if (inventoryItem.rowCount) {
-                    const quantity = Number(
-                        inventoryItem.rows[0].quantity
-                    );
-        
-                    // Сначала снимаем экипировку
+            
+                // Если предмета нет — отменяем всю транзакцию
+                if (!inventoryItem.rowCount) {
+                    throw new Error('LOCK_INVENTORY_ITEM_MISSING');
+                }
+            
+                const quantity = Number(inventoryItem.rows[0].quantity);
+            
+                if (quantity < 1) {
+                    throw new Error('LOCK_INVENTORY_ITEM_MISSING');
+                }
+            
+                // Удаляем только конкретную экипировку из нужного слота
+                const unequipResult = await client.query(
+                    `DELETE FROM player_equipment
+                     WHERE player_id = $1
+                       AND slot_type = 'roulette_modifier'
+                       AND slot_number = $2
+                       AND item_code = 'roulette_mod_lock'
+                     RETURNING slot_number`,
+                    [canonicalId, lockResult.rows[0].slot_number]
+                );
+            
+                if (unequipResult.rowCount !== 1) {
+                    throw new Error('LOCK_EQUIPMENT_NOT_FOUND');
+                }
+            
+                // Уменьшаем количество предметов в инвентаре
+                if (quantity === 1) {
                     await client.query(
-                        `DELETE FROM player_equipment
+                        `DELETE FROM player_inventory
                          WHERE player_id = $1
                            AND item_code = 'roulette_mod_lock'`,
                         [canonicalId]
                     );
-        
-                    if (quantity <= 1) {
-                        await client.query(
-                            `DELETE FROM player_inventory
-                             WHERE player_id = $1
-                               AND item_code = 'roulette_mod_lock'`,
-                            [canonicalId]
-                        );
-                    } else {
-                        await client.query(
-                            `UPDATE player_inventory
-                             SET quantity = quantity - 1,
-                                 updated_at = NOW()
-                             WHERE player_id = $1
-                               AND item_code = 'roulette_mod_lock'`,
-                            [canonicalId]
-                        );
-                    }
+                } else {
+                    await client.query(
+                        `UPDATE player_inventory
+                         SET quantity = quantity - 1,
+                             updated_at = NOW()
+                         WHERE player_id = $1
+                           AND item_code = 'roulette_mod_lock'`,
+                        [canonicalId]
+                    );
                 }
-        
+            
                 lockConsumed = true;
             }
-        }
         
         const completionResult = {
             success: true,
@@ -3378,6 +3425,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             PLAYER_NOT_FOUND: [404, 'Player not found'],
             SESSION_NOT_FOUND: [404, 'Вращение не найдено'],
             SESSION_NOT_PENDING: [409, 'Вращение уже завершено'],
+            LOCK_INVENTORY_ITEM_MISSING: [409, 'Модификатор «Закрепление» отсутствует в инвентаре'],
+            LOCK_EQUIPMENT_NOT_FOUND: [409, 'Не удалось снять экипировку «Закрепление»'],
             INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
         };
 
