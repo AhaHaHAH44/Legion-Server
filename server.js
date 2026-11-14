@@ -2894,6 +2894,7 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
 
         client = await pool.connect();
         await client.query('BEGIN');
+
         await client.query(`SET LOCAL lock_timeout = '5s'`);
         await client.query(`SET LOCAL statement_timeout = '15s'`);
 
@@ -2910,7 +2911,7 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('PLAYER_NOT_FOUND');
         }
 
-        // Блокируем текущее незавершённое вращение
+        // Проверяем текущую сессию
         const sessionResult = await client.query(
             `SELECT *
              FROM roulette_solo_sessions
@@ -2945,20 +2946,19 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             });
         }
 
-        // Проверяем корректность текущих символов
+        // Получаем исходные символы текущей игры
         const reels = Array.isArray(session.reels)
             ? session.reels
             : JSON.parse(session.reels);
 
         if (
             reels.length !== 3 ||
-            !reels[keepIndex] ||
             reels.some(item => !item || typeof item.id !== 'string')
         ) {
             throw new Error('INVALID_SESSION_REELS');
         }
 
-        // Находим экипированный модификатор «Закрепление»
+        // Находим экипированный модификатор
         const modifier = await client.query(
             `SELECT
                 slot_number,
@@ -2979,12 +2979,10 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
 
         const equippedLock = modifier.rows[0];
 
-        // Нельзя активировать уже действующее закрепление
         if (Number(equippedLock.lock_remaining_games) > 0) {
             throw new Error('LOCK_ALREADY_ACTIVE');
         }
 
-        // Защита от повторной активации в том же вращении
         if (
             equippedLock.lock_reel_index !== null ||
             equippedLock.lock_reel_item !== null
@@ -2992,7 +2990,7 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('LOCK_ALREADY_USED');
         }
 
-        // Проверяем, что предмет действительно есть в инвентаре
+        // Проверяем наличие предмета в инвентаре
         const inventoryItem = await client.query(
             `SELECT quantity
              FROM player_inventory
@@ -3007,30 +3005,11 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('LOCK_ITEM_NOT_OWNED');
         }
 
-        // Запоминаем выбранный символ
+        // Сохраняем выбранный символ без изменения остальных
         const keptItem = reels[keepIndex];
-        const replacedItems = [];
 
-        // Перебрасываем два остальных символа
-        for (let index = 0; index < 3; index++) {
-            if (index === keepIndex) continue;
-
-            const previousItem = reels[index];
-
-            const newItem = await getCatReckoningResource(
-                session.cat_reckoning?.modifierCount ?? 0
-            );
-
-            reels[index] = newItem;
-
-            replacedItems.push({
-                index,
-                previousItem,
-                newItem
-            });
-        }
-
-        // Активируем закрепление на три завершённые игры
+        // Активируем закрепление на 3 игры:
+        // текущую и две следующие
         const updateLock = await client.query(
             `UPDATE player_equipment
              SET lock_remaining_games = 3,
@@ -3055,14 +3034,6 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('LOCK_ALREADY_ACTIVE');
         }
 
-        // Сохраняем обновлённые символы текущего вращения
-        await client.query(
-            `UPDATE roulette_solo_sessions
-             SET reels = $2::jsonb
-             WHERE id = $1`,
-            [sessionId, JSON.stringify(reels)]
-        );
-
         await client.query('COMMIT');
 
         return res.json({
@@ -3071,7 +3042,6 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             reels,
             keptIndex: keepIndex,
             keptItem,
-            replacedItems,
             score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
