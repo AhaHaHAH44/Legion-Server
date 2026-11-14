@@ -427,7 +427,7 @@ async function grantRouletteJackpotModifier(db, playerId, reels) {
         iron: {
             unlockCode: 'roulette_unlock_iron',
             itemCode: 'roulette_mod_lock',
-            name: 'Повтор'
+            name: 'Закрепление'
         },
         coal: {
             unlockCode: 'roulette_unlock_coal',
@@ -3016,6 +3016,25 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             [canonicalId, nextAt]
         );
 
+        // Уменьшаем срок закрепления после завершённой соло-игры
+        const lockResult = await client.query(
+            `UPDATE player_equipment
+             SET lock_remaining_games = GREATEST(lock_remaining_games - 1, 0)
+             WHERE player_id = $1
+               AND item_code = 'roulette_mod_lock'
+               AND lock_remaining_games > 0
+             RETURNING slot_number, lock_remaining_games`,
+            [canonicalId]
+        );
+        
+        const modifierLock = lockResult.rowCount > 0
+            ? {
+                active: lockResult.rows[0].lock_remaining_games > 0,
+                slotNumber: lockResult.rows[0].slot_number,
+                remainingGames: lockResult.rows[0].lock_remaining_games
+            }
+            : null;
+
         // Закрываем сессию
         // Формируем результат вращения
         const completionResult = {
@@ -3029,7 +3048,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             modifierDrop,
             balance: newBalance,
             nextAt,
-            cooldownMs: cooldownDuration
+            cooldownMs: cooldownDuration,
+            modifierLock
         };
         
         // Закрываем сессию и сохраняем результат
@@ -4307,6 +4327,7 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
                 slot_numbers.slot_number,
                 (p.id IS NOT NULL) AS unlocked,
                 e.item_code,
+                e.lock_remaining_games,
                 i.name AS item_name,
                 i.icon AS item_icon,
                 i.rarity AS item_rarity
@@ -4461,16 +4482,23 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
          }
 
          // Добавляем предмет в экипировку
-         await client.query(
-             `INSERT INTO player_equipment (
-                 player_id,
-                 item_code,
-                 slot_type,
-                 slot_number
-              )
-              VALUES ($1, $2, $3, $4)`,
-             [canonicalId, itemCode, slotType, slotNumber]
-         );
+        await client.query(
+            `INSERT INTO player_equipment (
+                player_id,
+                item_code,
+                slot_type,
+                slot_number,
+                lock_remaining_games
+             )
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+                canonicalId,
+                itemCode,
+                slotType,
+                slotNumber,
+                itemCode === 'roulette_mod_lock' ? 3 : 0
+            ]
+        );
 
          await client.query('COMMIT');
 
@@ -4553,10 +4581,11 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
 
          // Блокируем выбранный слот
          const slot = await client.query(
-             `SELECT
-                 s.slot_type,
-                 s.slot_number,
-                 e.item_code
+            `SELECT
+                s.slot_type,
+                s.slot_number,
+                e.item_code,
+                e.lock_remaining_games
               FROM inventory_slots s
               LEFT JOIN player_equipment e
                  ON e.player_id = s.player_id
@@ -4578,6 +4607,10 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
          if (!itemCode) {
              throw new Error('SLOT_EMPTY');
          }
+
+         if (Number(slot.rows[0].lock_remaining_games) > 0) {
+            throw new Error('ITEM_TEMPORARILY_LOCKED');
+        }
 
          // Удаляем экипировку, но сохраняем предмет в инвентаре
          await client.query(
@@ -4606,7 +4639,9 @@ app.post('/api/roulette/matches/:matchId/spin', async (req, res) => {
          const errors = {
              PLAYER_NOT_FOUND: [404, 'Player not found'],
              SLOT_NOT_FOUND: [404, 'Slot not found'],
-             SLOT_EMPTY: [409, 'Slot is already empty']
+             SLOT_EMPTY: [409, 'Slot is already empty'],
+             ITEM_TEMPORARILY_LOCKED: [403, 'Модификатор закреплён и пока не может быть снят'
+],
          };
 
          const [status, message] = errors[error.message] || [
@@ -5387,6 +5422,7 @@ async function initializeDatabase() {
                 slot_number INTEGER NOT NULL,
             
                 equipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                lock_remaining_games INTEGER NOT NULL DEFAULT 0,
             
                 -- Один предмет не может находиться в нескольких слотах
                 PRIMARY KEY (player_id, item_code),
@@ -5402,6 +5438,9 @@ async function initializeDatabase() {
                     REFERENCES inventory_slots(player_id, slot_type, slot_number)
                     ON DELETE CASCADE
             );
+
+            ALTER TABLE player_equipment
+            ADD COLUMN IF NOT EXISTS lock_remaining_games INTEGER NOT NULL DEFAULT 0;
             
             
             -- Индексы для быстрого получения предметов игрока
@@ -5573,7 +5612,7 @@ async function initializeDatabase() {
             (
                 'roulette_mod_lock',
                 'Повтор',
-                'Модификатор Кото-рулетки, получаемый за джекпот из трёх железных символов.',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх железа.',
                 'roulette_modifier',
                 'uncommon',
                 '🔁',
@@ -5586,7 +5625,7 @@ async function initializeDatabase() {
             (
                 'roulette_mod_duplicate',
                 'Дублирование',
-                'Модификатор Кото-рулетки, получаемый за джекпот из трёх угольных символов.',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх угля.',
                 'roulette_modifier',
                 'rare',
                 '✨',
@@ -5599,7 +5638,7 @@ async function initializeDatabase() {
             (
                 'roulette_mod_second_chance',
                 'Лихорадка',
-                'Модификатор Кото-рулетки, получаемый за джекпот из трёх золотых символов.',
+                'Модификатор Кото-рулетки, получаемый за джекпот из трёх золота.',
                 'roulette_modifier',
                 'rare',
                 '🔥',
@@ -5703,7 +5742,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_pebble',
                 'Механика камушка',
-                'Разблокирует получение модификатора «Переброс» за джекпот из трёх камушков 🪨🪨🪨. При покупке вы получите один «Переброс» в подарок.',
+                'Разблокирует получение модификатора «Переброс» за джекпот из трёх камушков 🪨🪨🪨. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 100,
                 TRUE,
@@ -5713,7 +5752,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_limestone',
                 'Механика известняка',
-                'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите одну «Страховку» в подарок.',
+                'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 200,
                 TRUE,
@@ -5723,7 +5762,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_iron',
                 'Механика железа',
-                'Разблокирует получение модификатора «Повтор» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Повтор» за джекпот из трёх железа ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 300,
                 TRUE,
@@ -5733,7 +5772,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_coal',
                 'Механика угля',
-                'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угля ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 400,
                 TRUE,
@@ -5743,7 +5782,7 @@ async function initializeDatabase() {
             (
                 'roulette_unlock_gold',
                 'Механика золота',
-                'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
+                'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золота 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
                 'unlock',
                 500,
                 TRUE,
@@ -5822,17 +5861,17 @@ async function initializeDatabase() {
             -- Обновление описания разблокировки в магазине
             UPDATE shop_items
             SET
-                description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите одну «Страховку» в подарок.',
+                description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
                 inventory_item_code = 'roulette_mod_pair_save'
             WHERE code = 'roulette_unlock_limestone';
 
             -- Обновление существующих модификаторов
             UPDATE inventory_items
             SET
-                name = 'Повтор',
-                description = 'Модификатор Кото-рулетки, получаемый за джекпот из трёх железных символов.',
-                icon = '🔁',
-                metadata = '{"modifier_id":"repeat","trigger":"iron_triple"}'::jsonb
+                name = 'Закрепление',
+                description = 'Закрепляет модификатор в слоте на три завершённые одиночные игры, включая текущую.',
+                icon = '🔒',
+                metadata = '{"modifier_id":"lock","trigger":"iron_triple"}'::jsonb
             WHERE code = 'roulette_mod_lock';
             
             UPDATE inventory_items
@@ -5854,19 +5893,19 @@ async function initializeDatabase() {
             -- Обновление существующих разблокировок магазина
             UPDATE shop_items
             SET
-                description = 'Разблокирует получение модификатора «Повтор» за джекпот из трёх железных символов ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
+                description = 'Разблокирует получение модификатора «Закрепление» за джекпот из трёх железа ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
                 inventory_item_code = 'roulette_mod_lock'
             WHERE code = 'roulette_unlock_iron';
             
             UPDATE shop_items
             SET
-                description = 'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угольных символов ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
+                description = 'Разблокирует получение модификатора «Дублирование» за джекпот из трёх угля ⬛⬛⬛. При покупке вы получите один модификатор в подарок.',
                 inventory_item_code = 'roulette_mod_duplicate'
             WHERE code = 'roulette_unlock_coal';
             
             UPDATE shop_items
             SET
-                description = 'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золотых символов 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
+                description = 'Разблокирует получение модификатора «Лихорадка» за джекпот из трёх золота 🟡🟡🟡. При покупке вы получите один модификатор в подарок.',
                 inventory_item_code = 'roulette_mod_second_chance'
             WHERE code = 'roulette_unlock_gold';
 
