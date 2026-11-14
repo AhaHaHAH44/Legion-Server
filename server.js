@@ -2537,6 +2537,28 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
             throw new Error('INVALID_SESSION_REELS');
         }
 
+        // Проверяем, не пытается ли Переброс изменить закреплённый слот
+        const activeLockResult = await client.query(
+            `SELECT lock_reel_index, lock_remaining_games
+             FROM player_equipment
+             WHERE player_id = $1
+               AND item_code = 'roulette_mod_lock'
+               AND slot_type = 'roulette_modifier'
+               AND lock_remaining_games > 0
+             FOR UPDATE`,
+            [canonicalId]
+        );
+        
+        if (activeLockResult.rowCount > 0) {
+            const activeLock = activeLockResult.rows[0];
+        
+            if (Number(activeLock.lock_reel_index) === index) {
+                throw new Error(
+                    `LOCKED_REEL_${Number(activeLock.lock_remaining_games)}`
+                );
+            }
+        }
+
         // Генерируем новый символ с учётом «Кошачьей расплаты»
         const previousItem = reels[index];
         const newItem = await getCatReckoningResource(
@@ -2595,6 +2617,16 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
     } catch (error) {
         if (client) {
             await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const lockedMatch = /^LOCKED_REEL_(\d+)$/.exec(error.message);
+
+        if (lockedMatch) {
+            return res.status(409).json({
+                error: `🔒 Слот закреплён ещё на ${lockedMatch[1]} игр`,
+                code: 'LOCKED_REEL',
+                remainingGames: Number(lockedMatch[1])
+            });
         }
 
         const errors = {
@@ -2770,20 +2802,55 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
             throw new Error('INVALID_SESSION_REELS');
         }
 
-        // Сохраняем выбранный символ, два других перебрасываем
+        // Проверяем активное закрепление
+        const activeLockResult = await client.query(
+            `SELECT lock_reel_index, lock_remaining_games
+             FROM player_equipment
+             WHERE player_id = $1
+               AND item_code = 'roulette_mod_lock'
+               AND slot_type = 'roulette_modifier'
+               AND lock_remaining_games > 0
+             FOR UPDATE`,
+            [canonicalId]
+        );
+        
+        const activeLock = activeLockResult.rowCount > 0
+            ? activeLockResult.rows[0]
+            : null;
+        
+        const lockedIndex = activeLock
+            ? Number(activeLock.lock_reel_index)
+            : null;
+        
+        // Закреплённый слот нельзя выбирать как обычный слот Страховки
+        if (lockedIndex !== null && keepIndex === lockedIndex) {
+            throw new Error(
+                `INSURANCE_KEEP_LOCKED_${Number(activeLock.lock_remaining_games)}`
+            );
+        }
+
+        // Сохраняем выбранный символ и автоматически сохраняем закреплённый
         const keptItem = reels[keepIndex];
         const replacedItems = [];
-
+        
+        const preservedIndexes = new Set([keepIndex]);
+        
+        if (lockedIndex !== null) {
+            preservedIndexes.add(lockedIndex);
+        }
+        
         for (let index = 0; index < 3; index++) {
-            if (index === keepIndex) continue;
-
+            // Не перебрасываем выбранный и закреплённый слоты
+            if (preservedIndexes.has(index)) continue;
+        
             const previousItem = reels[index];
+        
             const newItem = await getCatReckoningResource(
                 session.cat_reckoning?.modifierCount ?? 0
             );
-            
+        
             reels[index] = newItem;
-
+        
             replacedItems.push({
                 index,
                 previousItem,
@@ -2840,6 +2907,16 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
     } catch (error) {
         if (client) {
             await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const lockedMatch = /^INSURANCE_KEEP_LOCKED_(\d+)$/.exec(error.message);
+
+        if (lockedMatch) {
+            return res.status(409).json({
+                error: `🔒 Этот слот уже закреплён ещё на ${lockedMatch[1]} игр. Выбери другой.`,
+                code: 'INSURANCE_KEEP_LOCKED',
+                remainingGames: Number(lockedMatch[1])
+            });
         }
 
         const errors = {
