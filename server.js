@@ -2234,6 +2234,7 @@ app.post('/api/roulette/solo', async (req, res) => {
                     rerollUsed: Boolean(session.reroll_used),
                     insuranceUsed: Boolean(session.insurance_used),
                     lockUsed: Boolean(session.lock_used),
+                    duplicateUsed: Boolean(session.duplicate_used),
                     sessionId: session.id,
                     reels: session.reels,
                     catReckoning: session.cat_reckoning || {},
@@ -3044,6 +3045,310 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
         ];
 
         console.error('Solo roulette insurance failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Дублирование: скопировать один символ в другой слот
+app.post('/api/roulette/solo/duplicate', async (req, res) => {
+    const {
+        playerId,
+        sessionId,
+        sourceIndex,
+        targetIndex
+    } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) ||
+        !Number.isInteger(sourceIndex) ||
+        !Number.isInteger(targetIndex) ||
+        sourceIndex < 0 || sourceIndex > 2 ||
+        targetIndex < 0 || targetIndex > 2 ||
+        sourceIndex === targetIndex
+    ) {
+        return res.status(400).json({
+            error: 'Invalid duplicate data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
+
+        // Блокируем аккаунт игрока
+        const account = await client.query(
+            `SELECT player_id
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Получаем и блокируем текущую сессию
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_solo_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        if (session.status !== 'pending') {
+            throw new Error('SESSION_NOT_PENDING');
+        }
+
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(409).json({
+                error: 'Время вращения истекло'
+            });
+        }
+
+        // Проверяем, использовалось ли Дублирование
+        if (session.duplicate_used) {
+            throw new Error('DUPLICATE_ALREADY_USED');
+        }
+
+        // Проверяем разблокировку механики
+        const unlocked = await client.query(
+            `SELECT id
+             FROM player_purchases
+             WHERE player_id = $1
+               AND item_code = 'roulette_unlock_coal'`,
+            [canonicalId]
+        );
+
+        if (!unlocked.rowCount) {
+            throw new Error('DUPLICATE_NOT_UNLOCKED');
+        }
+
+        // Проверяем наличие экипированного модификатора
+        const modifier = await client.query(
+            `SELECT pi.quantity
+             FROM player_inventory pi
+             JOIN player_equipment pe
+                ON pe.player_id = pi.player_id
+                AND pe.item_code = pi.item_code
+             JOIN inventory_items i
+                ON i.code = pi.item_code
+             WHERE pi.player_id = $1
+               AND pi.item_code = 'roulette_mod_duplicate'
+               AND pi.quantity > 0
+               AND i.is_active = TRUE
+               AND pe.slot_type = 'roulette_modifier'
+             FOR UPDATE OF pi`,
+            [canonicalId]
+        );
+
+        if (!modifier.rowCount) {
+            throw new Error('DUPLICATE_ITEM_NOT_EQUIPPED');
+        }
+
+        // Проверяем сохранённые символы
+        const reels = Array.isArray(session.reels)
+            ? session.reels
+            : JSON.parse(session.reels);
+
+        if (
+            reels.length !== 3 ||
+            !reels[sourceIndex] ||
+            !reels[targetIndex]
+        ) {
+            throw new Error('INVALID_SESSION_REELS');
+        }
+
+        // Проверяем активное Закрепление
+        const activeLockResult = await client.query(
+            `SELECT lock_reel_index, lock_remaining_games
+             FROM player_equipment
+             WHERE player_id = $1
+               AND item_code = 'roulette_mod_lock'
+               AND slot_type = 'roulette_modifier'
+               AND lock_remaining_games > 0
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        const activeLock = activeLockResult.rowCount
+            ? activeLockResult.rows[0]
+            : null;
+
+        const lockedIndex = activeLock
+            ? Number(activeLock.lock_reel_index)
+            : null;
+
+        // Нельзя заменять символ в закреплённом слоте
+        if (lockedIndex === targetIndex) {
+            throw new Error(
+                `DUPLICATE_TARGET_LOCKED_${Number(activeLock.lock_remaining_games)}`
+            );
+        }
+
+        // Проверяем шанс поломки при использовании двух
+        // и более модификаторов
+        const modifierCount = Number(
+            session.cat_reckoning?.modifierCount ?? 0
+        );
+
+        const modifierBroken =
+            modifierCount >= 2 &&
+            crypto.randomInt(100) < 20;
+
+        const quantity = Number(modifier.rows[0].quantity);
+
+        // Списываем один экземпляр Дублирования
+        async function consumeDuplicate() {
+            if (quantity === 1) {
+                await client.query(
+                    `DELETE FROM player_inventory
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_duplicate'`,
+                    [canonicalId]
+                );
+            } else {
+                await client.query(
+                    `UPDATE player_inventory
+                     SET quantity = quantity - 1,
+                         updated_at = NOW()
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_duplicate'`,
+                    [canonicalId]
+                );
+            }
+        }
+
+        // Модификатор сломался
+        if (modifierBroken) {
+            await consumeDuplicate();
+
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET duplicate_used = TRUE
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                success: true,
+                sessionId,
+                reels,
+                modifierOutcome: 'broken',
+                modifierBroken: true,
+                duplicateUsed: true,
+                remainingQuantity: quantity - 1,
+                score: getRouletteScore(reels),
+                multiplier: getRouletteMultiplier(reels),
+                jackpot: getRouletteJackpot(reels)
+            });
+        }
+
+        // Запоминаем исходный и заменяемый символы
+        const sourceItem = { ...reels[sourceIndex] };
+        const previousTargetItem = { ...reels[targetIndex] };
+
+        // Копируем выбранный символ в целевой слот
+        reels[targetIndex] = { ...sourceItem };
+
+        await consumeDuplicate();
+
+        // Сохраняем результат
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET reels = $2::jsonb,
+                 duplicate_used = TRUE
+             WHERE id = $1`,
+            [sessionId, JSON.stringify(reels)]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            sessionId,
+            reels,
+            sourceIndex,
+            targetIndex,
+            sourceItem,
+            previousTargetItem,
+            modifierOutcome: 'applied',
+            modifierBroken: false,
+            duplicateUsed: true,
+            remainingQuantity: quantity - 1,
+            score: getRouletteScore(reels),
+            multiplier: getRouletteMultiplier(reels),
+            jackpot: getRouletteJackpot(reels)
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const lockedMatch =
+            /^DUPLICATE_TARGET_LOCKED_(\d+)$/.exec(error.message);
+
+        if (lockedMatch) {
+            return res.status(409).json({
+                error: `🔒 Этот слот закреплён ещё на ${lockedMatch[1]} игр`,
+                code: 'DUPLICATE_TARGET_LOCKED',
+                remainingGames: Number(lockedMatch[1])
+            });
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [404, 'Player not found'],
+            SESSION_NOT_FOUND: [404, 'Вращение не найдено'],
+            SESSION_NOT_PENDING: [409, 'Вращение уже завершено'],
+            DUPLICATE_ALREADY_USED: [409, 'Дублирование уже использовано'],
+            DUPLICATE_NOT_UNLOCKED: [403, 'Механика Дублирования не разблокирована'],
+            DUPLICATE_ITEM_NOT_EQUIPPED: [403, 'Экипируйте модификатор «Дублирование»'],
+            INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Solo roulette duplicate failed:', error);
 
         return res.status(status).json({
             error: message
@@ -5757,6 +6062,8 @@ async function initializeDatabase() {
         ADD COLUMN IF NOT EXISTS lock_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS cat_reckoning JSONB NOT NULL DEFAULT '{}'::jsonb;
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS duplicate_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
@@ -6423,13 +6730,6 @@ async function initializeDatabase() {
                 metadata = '{"modifier_id":"insurance","trigger":"limestone_triple"}'::jsonb
             WHERE code = 'roulette_mod_pair_save';
             
-            -- Обновление описания разблокировки в магазине
-            UPDATE shop_items
-            SET
-                description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
-                inventory_item_code = 'roulette_mod_pair_save'
-            WHERE code = 'roulette_unlock_limestone';
-
             -- Обновление существующих модификаторов
             UPDATE inventory_items
             SET
@@ -6442,7 +6742,7 @@ async function initializeDatabase() {
             UPDATE inventory_items
             SET
                 name = 'Дублирование',
-                description = 'Модификатор Кото-рулетки, получаемый за джекпот из трёх угольных символов.',
+                description = 'Позволяет выбрать один выпавший символ и скопировать его в другой слот рулетки.',
                 icon = '✨',
                 metadata = '{"modifier_id":"duplicate","trigger":"coal_triple"}'::jsonb
             WHERE code = 'roulette_mod_duplicate';
@@ -6456,6 +6756,17 @@ async function initializeDatabase() {
             WHERE code = 'roulette_mod_second_chance';
             
             -- Обновление существующих разблокировок магазина
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Переброс» за джекпот из трёх камушков 🪨🪨🪨. При покупке вы получите один модификатор в подарок.',
+                inventory_item_code = 'roulette_mod_reroll'
+            WHERE code = 'roulette_unlock_pebble';
+            UPDATE shop_items
+            SET
+                description = 'Разблокирует получение модификатора «Страховка» за джекпот из трёх известняков ⚪⚪⚪. При покупке вы получите один модификатор в подарок.',
+                inventory_item_code = 'roulette_mod_pair_save'
+            WHERE code = 'roulette_unlock_limestone';
+            
             UPDATE shop_items
             SET
                 description = 'Разблокирует получение модификатора «Закрепление» за джекпот из трёх железа ⛓️⛓️⛓️. При покупке вы получите один модификатор в подарок.',
