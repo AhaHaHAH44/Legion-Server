@@ -74,18 +74,493 @@ const MATCH_TIMEOUT = 300000;
 // HELPERS
 // ========================================
 
-// Преобразует дополнительный UUID в основной UUID аккаунта
+// Преобразует UUID и любую цепочку старых псевдонимов
+// в конечный основной UUID.
 async function resolvePlayerId(playerId, db = pool) {
+    if (typeof playerId !== 'string' || !playerId.trim()) {
+        throw new Error('INVALID_PLAYER_ID');
+    }
+
     const result = await db.query(
-        `SELECT player_id
-         FROM roulette_player_aliases
-         WHERE alias_id = $1`,
+        `WITH RECURSIVE alias_chain AS (
+            SELECT
+                alias_id,
+                player_id,
+                1 AS depth,
+                ARRAY[alias_id, player_id]::text[] AS visited
+            FROM roulette_player_aliases
+            WHERE alias_id = $1
+
+            UNION ALL
+
+            SELECT
+                a.alias_id,
+                a.player_id,
+                c.depth + 1,
+                c.visited || a.player_id
+            FROM roulette_player_aliases a
+            JOIN alias_chain c
+                ON a.alias_id = c.player_id
+            WHERE NOT a.player_id = ANY(c.visited)
+              AND c.depth < 100
+        )
+        SELECT player_id
+        FROM alias_chain
+        ORDER BY depth DESC
+        LIMIT 1`,
         [playerId]
     );
 
     return result.rowCount
         ? result.rows[0].player_id
         : playerId;
+}
+
+// ========================================
+// AUTO ACCOUNT MERGE
+// ========================================
+
+// Объединяет аккаунты с одинаковым никнеймом.
+// Основным становится UUID с самой поздней last_seen.
+async function mergeAccountsByNickname(db, incomingId, nickname) {
+    const normalizedNickname = String(nickname || '')
+        .trim()
+        .toLowerCase();
+
+    if (!normalizedNickname) {
+        throw new Error('INVALID_NICKNAME');
+    }
+
+    // Не допускаем одновременного объединения аккаунтов одного ника.
+    await db.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`legion-nickname:${normalizedNickname}`]
+    );
+
+    const resolvedIncomingId = await resolvePlayerId(incomingId, db);
+
+    // Создаём запись, если UUID ещё неизвестен.
+    // Не обновляем last_seen здесь: сначала определяем прежнего основного игрока.
+    await db.query(
+        `INSERT INTO roulette_accounts (player_id, nickname, last_seen)
+         VALUES ($1, $2, '-infinity'::timestamptz)
+         ON CONFLICT (player_id) DO NOTHING`,
+        [resolvedIncomingId, nickname.trim()]
+);
+
+    const accounts = await db.query(
+        `SELECT player_id, balance, last_seen, updated_at
+         FROM roulette_accounts
+         WHERE LOWER(BTRIM(nickname)) = $1
+            OR player_id = $2
+         ORDER BY last_seen DESC NULLS LAST,
+                 created_at ASC,
+                 player_id ASC
+         FOR UPDATE`,
+        [normalizedNickname, resolvedIncomingId]
+    );
+
+    if (!accounts.rowCount) {
+        throw new Error('PLAYER_ACCOUNT_NOT_FOUND');
+    }
+
+    const primaryId = accounts.rows[0].player_id;
+
+    const sourceIds = accounts.rows
+        .slice(1)
+        .map(row => row.player_id)
+        .filter(id => id !== primaryId);
+
+    // Обновляем активность главного аккаунта.
+    await db.query(
+        `UPDATE roulette_accounts
+         SET nickname = $2,
+             last_seen = NOW(),
+             updated_at = NOW()
+         WHERE player_id = $1`,
+        [primaryId, nickname.trim()]
+    );
+
+    for (const sourceId of sourceIds) {
+
+        // 1. Объединяем балансы.
+        await db.query(
+            `UPDATE roulette_accounts target
+             SET balance = target.balance + source.balance,
+                 last_seen = GREATEST(target.last_seen, source.last_seen),
+                 updated_at = NOW()
+             FROM roulette_accounts source
+             WHERE target.player_id = $1
+               AND source.player_id = $2`,
+            [primaryId, sourceId]
+        );
+
+        // 2. Переносим кулдауны.
+        await db.query(
+            `INSERT INTO roulette_cooldowns (player_id, next_at)
+             SELECT $1, next_at
+             FROM roulette_cooldowns
+             WHERE player_id = $2
+             ON CONFLICT (player_id) DO UPDATE
+             SET next_at = GREATEST(
+                 roulette_cooldowns.next_at,
+                 EXCLUDED.next_at
+             )`,
+            [primaryId, sourceId]
+        );
+
+        await db.query(
+            `DELETE FROM roulette_cooldowns
+             WHERE player_id = $2`,
+            [sourceId]
+        );
+
+        // 3. Переносим историю транзакций рулетки.
+        // При конфликте объединяем суммы и сохраняем обе записи details.
+        
+        await db.query(
+            `UPDATE roulette_transactions target
+             SET amount = target.amount + source.amount,
+                 details = jsonb_build_object(
+                     'merged_details',
+                     jsonb_build_array(target.details, source.details)
+                 )
+             FROM roulette_transactions source
+             WHERE source.player_id = $2
+               AND target.player_id = $1
+               AND source.match_id IS NOT NULL
+               AND target.match_id = source.match_id
+               AND target.type = source.type`,
+            [primaryId, sourceId]
+        );
+        
+        await db.query(
+            `UPDATE roulette_transactions source
+             SET player_id = $1
+             WHERE source.player_id = $2
+               AND (
+                   source.match_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM roulette_transactions target
+                       WHERE target.match_id = source.match_id
+                         AND target.player_id = $1
+                         AND target.type = source.type
+                   )
+               )`,
+            [primaryId, sourceId]
+        );
+        
+        await db.query(
+            `DELETE FROM roulette_transactions
+             WHERE player_id = $2`,
+            [sourceId]
+        );
+
+        // 4. Переносим историю Кото-КНБ.
+        // При конфликте объединяем суммы и сохраняем обе записи details.
+        
+        await db.query(
+            `UPDATE knb_transactions target
+             SET amount = target.amount + source.amount,
+                 details = jsonb_build_object(
+                     'merged_details',
+                     jsonb_build_array(target.details, source.details)
+                 )
+             FROM knb_transactions source
+             WHERE source.player_id = $2
+               AND target.player_id = $1
+               AND target.match_id = source.match_id
+               AND target.type = source.type`,
+            [primaryId, sourceId]
+        );
+        
+        await db.query(
+            `UPDATE knb_transactions source
+             SET player_id = $1
+             WHERE source.player_id = $2
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM knb_transactions target
+                   WHERE target.match_id = source.match_id
+                     AND target.player_id = $1
+                     AND target.type = source.type
+               )`,
+            [primaryId, sourceId]
+        );
+        
+        await db.query(
+            `DELETE FROM knb_transactions
+             WHERE player_id = $2`,
+            [sourceId]
+        );
+
+        // 5. Переносим историю вращений.
+        await db.query(
+            `UPDATE roulette_spins
+             SET player_id = $1
+             WHERE player_id = $2`,
+            [primaryId, sourceId]
+        );
+
+        // 6. Переносим соло-сессии.
+        // Если есть две незавершённые сессии, оставляем более новую.
+        await db.query(
+            `UPDATE roulette_solo_sessions target_session
+             SET status = 'expired'
+             WHERE target_session.player_id = $1
+               AND target_session.status = 'pending'
+               AND EXISTS (
+                   SELECT 1
+                   FROM roulette_solo_sessions source_session
+                   WHERE source_session.player_id = $2
+                     AND source_session.status = 'pending'
+                     AND source_session.created_at > target_session.created_at
+               )`,
+            [primaryId, sourceId]
+        );
+
+        await db.query(
+            `UPDATE roulette_solo_sessions source_session
+             SET status = 'expired'
+             WHERE source_session.player_id = $2
+               AND source_session.status = 'pending'
+               AND EXISTS (
+                   SELECT 1
+                   FROM roulette_solo_sessions target_session
+                   WHERE target_session.player_id = $1
+                     AND target_session.status = 'pending'
+                     AND target_session.created_at >= source_session.created_at
+               )`,
+            [primaryId, sourceId]
+        );
+
+        await db.query(
+            `UPDATE roulette_solo_sessions
+             SET player_id = $1
+             WHERE player_id = $2`,
+            [primaryId, sourceId]
+        );
+
+        // 7. Переносим покупки.
+        await db.query(
+            `INSERT INTO player_purchases
+                (player_id, item_code, price_paid, purchased_at)
+             SELECT $1, item_code, price_paid, purchased_at
+             FROM player_purchases
+             WHERE player_id = $2
+             ON CONFLICT (player_id, item_code) DO UPDATE
+             SET price_paid = LEAST(
+                    player_purchases.price_paid,
+                    EXCLUDED.price_paid
+                ),
+                purchased_at = LEAST(
+                    player_purchases.purchased_at,
+                    EXCLUDED.purchased_at
+                )`,
+            [primaryId, sourceId]
+        );
+
+        await db.query(
+            `DELETE FROM player_purchases
+             WHERE player_id = $1`,
+            [sourceId]
+        );
+
+        // 8. Объединяем предметы инвентаря.
+
+        // Проверяем лимиты стопок до переноса.
+        // При переполнении отменяется всё объединение.
+        
+        const stackCheck = await db.query(
+            `SELECT
+                 source.item_code,
+                 source.quantity AS source_quantity,
+                 COALESCE(target.quantity, 0) AS target_quantity,
+                 item.max_stack,
+                 item.is_stackable
+             FROM player_inventory source
+             JOIN inventory_items item
+               ON item.code = source.item_code
+             LEFT JOIN player_inventory target
+               ON target.player_id = $1
+              AND target.item_code = source.item_code
+             WHERE source.player_id = $2
+               AND source.quantity + COALESCE(target.quantity, 0) > item.max_stack
+             LIMIT 1`,
+            [primaryId, sourceId]
+        );
+        
+        if (stackCheck.rowCount) {
+            const itemCode = stackCheck.rows[0].item_code;
+        
+            throw new Error(
+                `INVENTORY_STACK_LIMIT_MERGE:${itemCode}`
+            );
+        }
+        
+        await db.query(
+            `INSERT INTO player_inventory
+                (player_id, item_code, quantity, acquired_at, updated_at)
+             SELECT $1, item_code, quantity, acquired_at, updated_at
+             FROM player_inventory
+             WHERE player_id = $2
+             ON CONFLICT (player_id, item_code) DO UPDATE
+             SET quantity = player_inventory.quantity + EXCLUDED.quantity,
+                 acquired_at = LEAST(
+                     player_inventory.acquired_at,
+                     EXCLUDED.acquired_at
+                 ),
+                 updated_at = NOW()`,
+            [primaryId, sourceId]
+        );
+
+        // 9. Переносим купленные слоты.
+        await db.query(
+            `INSERT INTO inventory_slots
+                (player_id, slot_type, slot_number, created_at)
+             SELECT $1, slot_type, slot_number, created_at
+             FROM inventory_slots
+             WHERE player_id = $2
+             ON CONFLICT (player_id, slot_type, slot_number) DO NOTHING`,
+            [primaryId, sourceId]
+        );
+
+        // 10. Переносим экипировку, если предмет и слот свободны.
+        await db.query(
+            `INSERT INTO player_equipment
+                (player_id, item_code, slot_type, slot_number, equipped_at,
+                 lock_remaining_games, lock_reel_index, lock_reel_item)
+             SELECT $1, source_eq.item_code, source_eq.slot_type,
+                    source_eq.slot_number, source_eq.equipped_at,
+                    source_eq.lock_remaining_games, source_eq.lock_reel_index,
+                    source_eq.lock_reel_item
+             FROM player_equipment source_eq
+             WHERE source_eq.player_id = $2
+               AND EXISTS (
+                   SELECT 1
+                   FROM player_inventory pi
+                   WHERE pi.player_id = $1
+                     AND pi.item_code = source_eq.item_code
+               )
+               AND EXISTS (
+                   SELECT 1
+                   FROM inventory_slots sl
+                   WHERE sl.player_id = $1
+                     AND sl.slot_type = source_eq.slot_type
+                     AND sl.slot_number = source_eq.slot_number
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM player_equipment target_eq
+                   WHERE target_eq.player_id = $1
+                     AND (
+                         target_eq.item_code = source_eq.item_code
+                         OR (
+                             target_eq.slot_type = source_eq.slot_type
+                             AND target_eq.slot_number = source_eq.slot_number
+                         )
+                     )
+               )
+             ON CONFLICT DO NOTHING`,
+            [primaryId, sourceId]
+        );
+
+        // Удаляем старую экипировку и слоты только после переноса.
+        await db.query(
+            `DELETE FROM player_equipment WHERE player_id = $1`,
+            [sourceId]
+        );
+
+        await db.query(
+            `DELETE FROM inventory_slots WHERE player_id = $1`,
+            [sourceId]
+        );
+
+        await db.query(
+            `DELETE FROM player_inventory WHERE player_id = $1`,
+            [sourceId]
+        );
+
+        // 11. Обновляем UUID в сохранённых матчах.
+        for (const table of ['roulette_matches', 'knb_matches']) {
+            await db.query(
+                `UPDATE ${table} m
+                 SET players = (
+                     SELECT COALESCE(
+                         jsonb_agg(
+                             CASE
+                                 WHEN player_entry->>'id' = $2
+                                 THEN jsonb_set(
+                                     player_entry,
+                                     '{id}',
+                                     to_jsonb($1::text)
+                                 )
+                                 ELSE player_entry
+                             END
+                         ),
+                         '[]'::jsonb
+                     )
+                     FROM jsonb_array_elements(m.players) AS player_entry
+                 )
+                 WHERE m.players @> $3::jsonb`,
+                [
+                    primaryId,
+                    sourceId,
+                    JSON.stringify([{ id: sourceId }])
+                ]
+            );
+        }
+
+        // 12. Переносим старые псевдонимы.
+        // Удаляем возможный конфликт с основным UUID.
+        await db.query(
+            `DELETE FROM roulette_player_aliases
+             WHERE alias_id = $1`,
+            [primaryId]
+        );
+
+        await db.query(
+            `UPDATE roulette_player_aliases
+             SET player_id = $1
+             WHERE player_id = $2`,
+            [primaryId, sourceId]
+        );
+
+        await db.query(
+            `INSERT INTO roulette_player_aliases (alias_id, player_id)
+             VALUES ($1, $2)
+             ON CONFLICT (alias_id) DO UPDATE
+             SET player_id = EXCLUDED.player_id`,
+            [sourceId, primaryId]
+        );
+
+        // 13. Удаляем старую запись аккаунта.
+        await db.query(
+            `DELETE FROM roulette_accounts
+             WHERE player_id = $1`,
+            [sourceId]
+        );
+    }
+
+    // Входящий UUID тоже становится псевдонимом.
+    if (resolvedIncomingId !== primaryId) {
+        await db.query(
+            `INSERT INTO roulette_player_aliases (alias_id, player_id)
+             VALUES ($1, $2)
+             ON CONFLICT (alias_id) DO UPDATE
+             SET player_id = EXCLUDED.player_id`,
+            [resolvedIncomingId, primaryId]
+        );
+    }
+
+    await db.query(
+        `DELETE FROM roulette_player_aliases
+         WHERE alias_id = $1`,
+        [primaryId]
+    );
+
+    return primaryId;
 }
 
 // Создаёт игроку стандартные слоты инвентаря
@@ -560,19 +1035,42 @@ app.post('/api/players/heartbeat', async (req, res) => {
 
     const cleanNickname = nickname.trim();
 
-    try {
-        const canonicalId = await resolvePlayerId(id);
+    let client;
 
-        const existingPlayer = players.get(canonicalId);
+    try {
+        client = await pool.connect();
+
+        await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+
+        const previousCanonicalId = await resolvePlayerId(id, client);
+
+        const existingPlayer = players.get(previousCanonicalId) ||
+            Array.from(players.values()).find(player =>
+                String(player.nickname || '').trim().toLowerCase() ===
+                cleanNickname.toLowerCase()
+            );
+        
         const isNew = !existingPlayer;
 
-        await pool.query(
-            `INSERT INTO roulette_accounts (player_id, nickname)
-             VALUES ($1, $2)
-             ON CONFLICT (player_id)
-             DO UPDATE SET nickname = EXCLUDED.nickname`,
-            [canonicalId, cleanNickname]
+        const canonicalId = await mergeAccountsByNickname(
+            client,
+            id,
+            cleanNickname
         );
+
+        await client.query('COMMIT');
+
+        // Удаляем старые онлайн-записи UUID с тем же никнеймом.
+        for (const [onlineId, onlinePlayer] of players) {
+            if (
+                onlineId !== canonicalId &&
+                String(onlinePlayer.nickname || '').trim().toLowerCase() ===
+                    cleanNickname.toLowerCase()
+            ) {
+                players.delete(onlineId);
+            }
+        }
 
         players.set(canonicalId, {
             id: canonicalId,
@@ -584,7 +1082,9 @@ app.post('/api/players/heartbeat', async (req, res) => {
         });
 
         if (isNew) {
-            console.log(`Player joined: ${cleanNickname} (${canonicalId})`);
+            console.log(
+                `Player joined: ${cleanNickname} (${canonicalId})`
+            );
         }
 
         return res.json({
@@ -594,11 +1094,28 @@ app.post('/api/players/heartbeat', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Player balance registration failed:', error);
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        console.error('Player account merge failed:', error);
+
+        if (error.message.startsWith('INVENTORY_STACK_LIMIT_MERGE:')) {
+            return res.status(409).json({
+                error: 'INVENTORY_MERGE_CONFLICT',
+                itemCode: error.message.split(':')[1],
+                message: 'Объединение остановлено: превышен лимит стопки. Данные не изменены.'
+            });
+        }
 
         return res.status(503).json({
             error: 'Database temporarily unavailable'
         });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
     }
 });
 
@@ -6068,6 +6585,21 @@ async function initializeDatabase() {
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS balance NUMERIC(14,2) NOT NULL DEFAULT 0;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        ALTER TABLE roulette_accounts
+        ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
+        
+        UPDATE roulette_accounts
+        SET last_seen = updated_at
+        WHERE last_seen IS NULL;
+        
+        ALTER TABLE roulette_accounts
+        ALTER COLUMN last_seen SET DEFAULT NOW();
+        
+        ALTER TABLE roulette_accounts
+        ALTER COLUMN last_seen SET NOT NULL;
+        
+        CREATE INDEX IF NOT EXISTS idx_roulette_accounts_nickname
+        ON roulette_accounts (LOWER(BTRIM(nickname)));
 
         ALTER TABLE roulette_cooldowns ADD COLUMN IF NOT EXISTS next_at BIGINT NOT NULL DEFAULT 0;
 
