@@ -353,10 +353,10 @@ async function applyCatReckoning(db, playerId, reels) {
         doubleCooldown: false
     };
 
-    // 3 модификатора: 5% шанс пустой ячейки для каждого символа
+    // 3 модификатора: 15% шанс пустой ячейки для каждого символа
     if (modifierCount >= 3) {
         for (let i = 0; i < reels.length; i++) {
-            if (crypto.randomInt(100) < 5) {
+            if (crypto.randomInt(100) < 15) {
                 effects.emptyIndices.push(i);
 
                 reels[i] = {
@@ -380,10 +380,10 @@ async function applyCatReckoning(db, playerId, reels) {
 // Генерируем новый символ с учётом уровня проклятия текущей сессии
 async function getCatReckoningResource(modifierCount) {
     // При 3 и более модификаторах
-    // каждый новый символ имеет 5% шанс стать пустым
+    // каждый новый символ имеет 15% шанс стать пустым
     if (
         Number(modifierCount) >= 3 &&
-        crypto.randomInt(100) < 5
+        crypto.randomInt(100) < 15
     ) {
         return {
             id: 'empty',
