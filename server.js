@@ -2766,6 +2766,9 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
 
         const session = sessionResult.rows[0];
 
+        // Получаем сохранённые эффекты «Кошачьей расплаты»
+        const catReckoning = session.cat_reckoning || {};
+
         // Уже завершённое вращение нельзя изменить
         if (session.status === 'completed') {
             if (session.completion_result) {
