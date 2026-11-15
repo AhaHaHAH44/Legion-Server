@@ -349,15 +349,9 @@ async function applyCatReckoning(db, playerId, reels) {
 
     const effects = {
         modifierCount,
-        rejectModifierDrop: false,
         emptyIndices: [],
         doubleCooldown: false
     };
-
-    // 2 модификатора: 20% шанс отклонить выпадение награды
-    if (modifierCount >= 2) {
-        effects.rejectModifierDrop = crypto.randomInt(100) < 20;
-    }
 
     // 3 модификатора: 5% шанс пустой ячейки для каждого символа
     if (modifierCount >= 3) {
@@ -2239,6 +2233,7 @@ app.post('/api/roulette/solo', async (req, res) => {
                     pending: true,
                     rerollUsed: Boolean(session.reroll_used),
                     insuranceUsed: Boolean(session.insurance_used),
+                    lockUsed: Boolean(session.lock_used),
                     sessionId: session.id,
                     reels: session.reels,
                     catReckoning: session.cat_reckoning || {},
@@ -2548,7 +2543,7 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
              FOR UPDATE`,
             [canonicalId]
         );
-        
+
         if (activeLockResult.rowCount > 0) {
             const activeLock = activeLockResult.rows[0];
         
@@ -2558,7 +2553,62 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
                 );
             }
         }
-
+        
+        // Проверяем шанс поломки при использовании двух и более модификаторов
+        const modifierCount = Number(
+            session.cat_reckoning?.modifierCount ?? 0
+        );
+        
+        const modifierBroken =
+            modifierCount >= 2 &&
+            crypto.randomInt(100) < 20;
+        
+        if (modifierBroken) {
+            const quantity = Number(modifier.rows[0].quantity);
+        
+            // Списываем один экземпляр Переброса
+            if (quantity === 1) {
+                await client.query(
+                    `DELETE FROM player_inventory
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_reroll'`,
+                    [canonicalId]
+                );
+            } else {
+                await client.query(
+                    `UPDATE player_inventory
+                     SET quantity = quantity - 1,
+                         updated_at = NOW()
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_reroll'`,
+                    [canonicalId]
+                );
+            }
+        
+            // Запоминаем неудачную попытку в текущем вращении
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET reroll_used = TRUE
+                 WHERE id = $1`,
+                [sessionId]
+            );
+        
+            await client.query('COMMIT');
+        
+            return res.json({
+                success: true,
+                sessionId,
+                reels,
+                modifierOutcome: 'broken',
+                modifierBroken: true,
+                rerollUsed: true,
+                remainingQuantity: quantity - 1,
+                score: getRouletteScore(reels),
+                multiplier: getRouletteMultiplier(reels),
+                jackpot: getRouletteJackpot(reels)
+            });
+        }
+        
         // Генерируем новый символ с учётом «Кошачьей расплаты»
         const previousItem = reels[index];
         const newItem = await getCatReckoningResource(
@@ -2610,6 +2660,8 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
             score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
+            modifierOutcome: 'applied',
+            modifierBroken: false,
             rerollUsed: true,
             remainingQuantity: quantity - 1
         });
@@ -2829,6 +2881,61 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
             );
         }
 
+        // Проверяем шанс поломки при использовании двух и более модификаторов
+        const modifierCount = Number(
+            session.cat_reckoning?.modifierCount ?? 0
+        );
+        
+        const modifierBroken =
+            modifierCount >= 2 &&
+            crypto.randomInt(100) < 20;
+        
+        if (modifierBroken) {
+            const quantity = Number(modifier.rows[0].quantity);
+        
+            // Списываем один экземпляр Страховки
+            if (quantity === 1) {
+                await client.query(
+                    `DELETE FROM player_inventory
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_pair_save'`,
+                    [canonicalId]
+                );
+            } else {
+                await client.query(
+                    `UPDATE player_inventory
+                     SET quantity = quantity - 1,
+                         updated_at = NOW()
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_pair_save'`,
+                    [canonicalId]
+                );
+            }
+        
+            // Запоминаем неудачную попытку в текущем вращении
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET insurance_used = TRUE
+                 WHERE id = $1`,
+                [sessionId]
+            );
+        
+            await client.query('COMMIT');
+        
+            return res.json({
+                success: true,
+                sessionId,
+                reels,
+                modifierOutcome: 'broken',
+                modifierBroken: true,
+                insuranceUsed: true,
+                remainingQuantity: quantity - 1,
+                score: getRouletteScore(reels),
+                multiplier: getRouletteMultiplier(reels),
+                jackpot: getRouletteJackpot(reels)
+            });
+        }
+        
         // Сохраняем выбранный символ и автоматически сохраняем закреплённый
         const keptItem = reels[keepIndex];
         const replacedItems = [];
@@ -2900,6 +3007,8 @@ app.post('/api/roulette/solo/insurance', async (req, res) => {
             score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
+            modifierOutcome: 'applied',
+            modifierBroken: false,
             insuranceUsed: true,
             remainingQuantity: quantity - 1
         });
@@ -3007,6 +3116,11 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
         if (session.status !== 'pending') {
             throw new Error('SESSION_NOT_PENDING');
         }
+        
+        // Проверяем, использовалось ли Закрепление в текущем вращении
+        if (session.lock_used) {
+            throw new Error('LOCK_ALREADY_USED');
+        }
 
         if (new Date(session.expires_at).getTime() <= Date.now()) {
             await client.query(
@@ -3082,6 +3196,57 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('LOCK_ITEM_NOT_OWNED');
         }
 
+        // Проверяем шанс поломки при использовании двух и более модификаторов
+        const modifierCount = Number(
+            session.cat_reckoning?.modifierCount ?? 0
+        );
+        
+        const modifierBroken =
+            modifierCount >= 2 &&
+            crypto.randomInt(100) < 20;
+        
+        if (modifierBroken) {
+            const quantity = Number(inventoryItem.rows[0].quantity);
+        
+            // Списываем только один экземпляр Закрепления
+            if (quantity === 1) {
+                await client.query(
+                    `DELETE FROM player_inventory
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_lock'`,
+                    [canonicalId]
+                );
+            } else {
+                await client.query(
+                    `UPDATE player_inventory
+                     SET quantity = quantity - 1,
+                         updated_at = NOW()
+                     WHERE player_id = $1
+                       AND item_code = 'roulette_mod_lock'`,
+                    [canonicalId]
+                );
+            }
+        
+            // Запоминаем неудачную попытку в текущей сессии
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET lock_used = TRUE
+                 WHERE id = $1`,
+                [sessionId]
+            );
+        
+            await client.query('COMMIT');
+        
+            return res.json({
+                success: true,
+                sessionId,
+                modifierOutcome: 'broken',
+                modifierBroken: true,
+                lockUsed: true,
+                remainingQuantity: quantity - 1
+            });
+        }
+
         // Сохраняем выбранный символ без изменения остальных
         const keptItem = reels[keepIndex];
 
@@ -3111,6 +3276,14 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             throw new Error('LOCK_ALREADY_ACTIVE');
         }
 
+        // Отмечаем успешное использование Закрепления
+        await client.query(
+            `UPDATE roulette_solo_sessions
+             SET lock_used = TRUE
+             WHERE id = $1`,
+            [sessionId]
+        );
+
         await client.query('COMMIT');
 
         return res.json({
@@ -3119,6 +3292,9 @@ app.post('/api/roulette/solo/lock', async (req, res) => {
             reels,
             keptIndex: keepIndex,
             keptItem,
+            modifierOutcome: 'applied',
+            modifierBroken: false,
+            lockUsed: true,
             score: getRouletteScore(reels),
             multiplier: getRouletteMultiplier(reels),
             jackpot: getRouletteJackpot(reels),
@@ -3262,26 +3438,12 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         const multiplier = getRouletteMultiplier(reels);
         const jackpot = getRouletteJackpot(reels);
 
-        // Проверяем джекпот и учитываем «Кошачью расплату»
-        let modifierDrop;
-        
-        const catReckoning = session.cat_reckoning || {};
-        
-        if (catReckoning.rejectModifierDrop) {
-            // Кошачья расплата отклонила выпадение награды
-            modifierDrop = {
-                granted: false,
-                rejected: true,
-                reason: 'cat_reckoning'
-            };
-        } else {
-            // Обычная выдача модификатора за джекпот
-            modifierDrop = await grantRouletteJackpotModifier(
-                client,
-                canonicalId,
-                reels
-            );
-        }
+        // Проверяем джекпот и выдаём модификатор при наличии разблокировки
+        const modifierDrop = await grantRouletteJackpotModifier(
+            client,
+            canonicalId,
+            reels
+        );
 
         // Начисляем очки
         const newBalance = Number(account.rows[0].balance) + score;
@@ -5588,6 +5750,8 @@ async function initializeDatabase() {
         ADD COLUMN IF NOT EXISTS reroll_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS insurance_used BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE roulette_solo_sessions
+        ADD COLUMN IF NOT EXISTS lock_used BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE roulette_solo_sessions
         ADD COLUMN IF NOT EXISTS cat_reckoning JSONB NOT NULL DEFAULT '{}'::jsonb;
         ALTER TABLE roulette_accounts ADD COLUMN IF NOT EXISTS nickname TEXT NOT NULL DEFAULT 'Игрок';
