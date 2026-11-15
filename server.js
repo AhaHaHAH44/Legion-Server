@@ -211,7 +211,7 @@ async function mergeAccountsByNickname(db, incomingId, nickname) {
 
         await db.query(
             `DELETE FROM roulette_cooldowns
-             WHERE player_id = $2`,
+             WHERE player_id = $1`,
             [sourceId]
         );
 
@@ -253,7 +253,7 @@ async function mergeAccountsByNickname(db, incomingId, nickname) {
         
         await db.query(
             `DELETE FROM roulette_transactions
-             WHERE player_id = $2`,
+             WHERE player_id = $1`,
             [sourceId]
         );
 
@@ -291,7 +291,7 @@ async function mergeAccountsByNickname(db, incomingId, nickname) {
         
         await db.query(
             `DELETE FROM knb_transactions
-             WHERE player_id = $2`,
+             WHERE player_id = $1`,
             [sourceId]
         );
 
