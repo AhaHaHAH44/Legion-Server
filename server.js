@@ -4262,6 +4262,15 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
         const score = getRouletteScore(reels);
         const multiplier = getRouletteMultiplier(reels);
         const jackpot = getRouletteJackpot(reels);
+        
+        // Штраф за три пустых символа
+        const allEmpty = reels.every(item => item.id === 'empty');
+        
+        const currentBalance = Number(account.rows[0].balance);
+        
+        const penalty = allEmpty
+            ? Math.round((currentBalance * 0.20 + Number.EPSILON) * 100) / 100
+            : 0;
 
         // Проверяем джекпот и выдаём модификатор при наличии разблокировки
         const modifierDrop = await grantRouletteJackpotModifier(
@@ -4270,8 +4279,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             reels
         );
 
-        // Начисляем очки
-        const newBalance = Number(account.rows[0].balance) + score;
+        // Начисляем награду и вычитаем штраф за три пустых символа
+        const newBalance = currentBalance + score - penalty;
 
         await client.query(
             `UPDATE roulette_accounts
@@ -4297,6 +4306,25 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
                 })
             ]
         );
+
+        // Записываем штраф за три пустых символа
+        if (penalty > 0) {
+            await client.query(
+                `INSERT INTO roulette_transactions
+                    (player_id, type, amount, details)
+                 VALUES ($1, 'solo_empty_penalty', $2, $3::jsonb)`,
+                [
+                    canonicalId,
+                    -penalty,
+                    JSON.stringify({
+                        sessionId,
+                        reels,
+                        reason: 'three_empty_symbols',
+                        penaltyPercent: 20
+                    })
+                ]
+            );
+        }
 
         // Записываем результат в историю вращений
         await client.query(
@@ -4419,6 +4447,8 @@ app.post('/api/roulette/solo/complete', async (req, res) => {
             sessionId,
             reels,
             score,
+            penalty,
+            allEmpty,
             multiplier,
             jackpot,
             modifierDrop,
