@@ -2677,6 +2677,768 @@ app.get('/api/roulette/status/:playerId', async (req, res) => {
     }
 });
 
+// Запуск отдельной сессии «Лихорадки»
+app.post('/api/roulette/fever/start', async (req, res) => {
+    const { playerId } = req.body || {};
+
+    if (typeof playerId !== 'string') {
+        return res.status(400).json({
+            error: 'Invalid playerId'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
+
+        // Блокируем аккаунт игрока
+        const account = await client.query(
+            `SELECT player_id, nickname, balance
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Проверяем, что игрок купил разблокировку Лихорадки
+        const unlocked = await client.query(
+            `SELECT id
+             FROM player_purchases
+             WHERE player_id = $1
+               AND item_code = 'roulette_unlock_gold'`,
+            [canonicalId]
+        );
+
+        if (!unlocked.rowCount) {
+            throw new Error('FEVER_NOT_UNLOCKED');
+        }
+
+        // Проверяем активную сессию Лихорадки
+        const pendingFever = await client.query(
+            `SELECT *
+             FROM roulette_fever_sessions
+             WHERE player_id = $1
+               AND status = 'pending'
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (pendingFever.rowCount) {
+            const session = pendingFever.rows[0];
+
+            // Если сессия ещё действует — возвращаем её,
+            // не списывая повторно модификатор
+            if (new Date(session.expires_at).getTime() > Date.now()) {
+                await client.query('COMMIT');
+
+                return res.json({
+                    success: true,
+                    mode: 'fever',
+                    pending: true,
+                    alreadyStarted: true,
+                    sessionId: session.id,
+                    currentRound: Number(session.current_round),
+                    rounds: session.rounds,
+                    expiresAt: session.expires_at
+                });
+            }
+
+            // Просроченную сессию закрываем
+            await client.query(
+                `UPDATE roulette_fever_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [session.id]
+            );
+        }
+
+        // Проверяем, что Лихорадка есть в инвентаре
+        // и экипирована в слот модификаторов
+        const modifier = await client.query(
+            `SELECT
+                pi.quantity,
+                pe.slot_number
+             FROM player_inventory pi
+             JOIN player_equipment pe
+               ON pe.player_id = pi.player_id
+              AND pe.item_code = pi.item_code
+             JOIN inventory_items i
+               ON i.code = pi.item_code
+             WHERE pi.player_id = $1
+               AND pi.item_code = 'roulette_mod_second_chance'
+               AND pi.quantity > 0
+               AND i.is_active = TRUE
+               AND pe.slot_type = 'roulette_modifier'
+             FOR UPDATE OF pi, pe`,
+            [canonicalId]
+        );
+
+        if (!modifier.rowCount) {
+            throw new Error('FEVER_ITEM_NOT_EQUIPPED');
+        }
+
+        // Проверяем обычную незавершённую соло-рулетку
+        const pendingSolo = await client.query(
+            `SELECT id, expires_at
+             FROM roulette_solo_sessions
+             WHERE player_id = $1
+               AND status = 'pending'
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (pendingSolo.rowCount) {
+            const soloSession = pendingSolo.rows[0];
+
+            if (new Date(soloSession.expires_at).getTime() > Date.now()) {
+                throw new Error('SOLO_SESSION_ACTIVE');
+            }
+
+            // Просроченную обычную сессию закрываем
+            await client.query(
+                `UPDATE roulette_solo_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [soloSession.id]
+            );
+        }
+
+        // Списываем один экземпляр Лихорадки
+        const quantity = Number(modifier.rows[0].quantity);
+
+        if (quantity === 1) {
+            await client.query(
+                `DELETE FROM player_inventory
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_second_chance'`,
+                [canonicalId]
+            );
+        } else {
+            await client.query(
+                `UPDATE player_inventory
+                 SET quantity = quantity - 1,
+                     updated_at = NOW()
+                 WHERE player_id = $1
+                   AND item_code = 'roulette_mod_second_chance'`,
+                [canonicalId]
+            );
+        }
+
+        // Создаём новую сессию на три прокрутки
+        const sessionId = crypto.randomUUID();
+        const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+
+        const nickname =
+            players.get(canonicalId)?.nickname ||
+            account.rows[0].nickname ||
+            'Игрок';
+
+        await client.query(
+            `INSERT INTO roulette_fever_sessions (
+                id,
+                player_id,
+                nickname,
+                current_round,
+                rounds,
+                status,
+                expires_at
+            )
+            VALUES ($1, $2, $3, 0, '[]'::jsonb, 'pending', $4)`,
+            [
+                sessionId,
+                canonicalId,
+                nickname,
+                expiresAt
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            mode: 'fever',
+            pending: true,
+            alreadyStarted: false,
+            sessionId,
+            currentRound: 0,
+            totalRounds: 3,
+            rounds: [],
+            expiresAt,
+            remainingQuantity: quantity - 1
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [
+                404,
+                'Игрок не найден'
+            ],
+            FEVER_NOT_UNLOCKED: [
+                403,
+                'Сначала разблокируйте Лихорадку в магазине'
+            ],
+            FEVER_ITEM_NOT_EQUIPPED: [
+                403,
+                'Экипируйте модификатор «Лихорадка»'
+            ],
+            SOLO_SESSION_ACTIVE: [
+                409,
+                'Сначала завершите обычную Кото-рулетку'
+            ]
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Fever start failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Одна прокрутка в режиме «Лихорадка»
+app.post('/api/roulette/fever/spin', async (req, res) => {
+    const { playerId, sessionId, roundNumber } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId) ||
+        !Number.isInteger(roundNumber) ||
+        roundNumber < 1 ||
+        roundNumber > 3
+    ) {
+        return res.status(400).json({
+            error: 'Invalid fever spin data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
+
+        // Блокируем аккаунт игрока
+        const account = await client.query(
+            `SELECT player_id
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Блокируем сессию Лихорадки
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_fever_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('FEVER_SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        // Проверяем статус сессии
+        if (session.status !== 'pending') {
+            throw new Error('FEVER_SESSION_NOT_PENDING');
+        }
+
+        // Проверяем срок действия
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_fever_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(409).json({
+                error: 'Время Лихорадки истекло'
+            });
+        }
+
+        // Получаем сохранённые результаты
+        const rounds = Array.isArray(session.rounds)
+            ? session.rounds
+            : JSON.parse(session.rounds);
+
+        const currentRound = Number(session.current_round);
+
+        if (
+            !Array.isArray(rounds) ||
+            rounds.length !== currentRound ||
+            currentRound < 0 ||
+            currentRound > 3
+        ) {
+            throw new Error('INVALID_FEVER_ROUNDS');
+        }
+
+        // Повторный запрос уже выполненной прокрутки
+        if (roundNumber <= currentRound) {
+            const savedRound = rounds[roundNumber - 1];
+
+            if (!savedRound || savedRound.round !== roundNumber) {
+                throw new Error('INVALID_FEVER_ROUNDS');
+            }
+
+            await client.query('COMMIT');
+
+            return res.json({
+                success: true,
+                mode: 'fever',
+                sessionId,
+                alreadyCompleted: true,
+                currentRound,
+                totalRounds: 3,
+                round: savedRound,
+                rounds
+            });
+        }
+
+        // Нельзя пропускать прокрутки
+        if (roundNumber !== currentRound + 1) {
+            throw new Error('FEVER_ROUND_OUT_OF_ORDER');
+        }
+
+        if (currentRound >= 3) {
+            throw new Error('FEVER_ALREADY_FINISHED');
+        }
+
+        // Генерируем три символа
+        const reels = spinRoulette();
+
+        // Применяем шанс пустых символов
+        // по количеству оставшихся экипированных модификаторов
+        const catReckoning = await applyCatReckoning(
+            client,
+            canonicalId,
+            reels
+        );
+
+        // Рассчитываем результат этой прокрутки
+        const score = getRouletteScore(reels);
+        const multiplier = getRouletteMultiplier(reels);
+        const jackpot = getRouletteJackpot(reels);
+
+        const savedRound = {
+            round: roundNumber,
+            reels,
+            score,
+            multiplier,
+            jackpot,
+            catReckoning
+        };
+
+        rounds.push(savedRound);
+
+        const nextRound = roundNumber;
+
+        // Сохраняем результат и прогресс
+        await client.query(
+            `UPDATE roulette_fever_sessions
+             SET current_round = $2,
+                 rounds = $3::jsonb
+             WHERE id = $1`,
+            [
+                sessionId,
+                nextRound,
+                JSON.stringify(rounds)
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            mode: 'fever',
+            sessionId,
+            alreadyCompleted: false,
+            currentRound: nextRound,
+            totalRounds: 3,
+            round: savedRound,
+            rounds,
+            finished: nextRound === 3
+        });
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [
+                404,
+                'Игрок не найден'
+            ],
+            FEVER_SESSION_NOT_FOUND: [
+                404,
+                'Сессия Лихорадки не найдена'
+            ],
+            FEVER_SESSION_NOT_PENDING: [
+                409,
+                'Сессия Лихорадки уже завершена'
+            ],
+            FEVER_ROUND_OUT_OF_ORDER: [
+                409,
+                'Нарушен порядок прокруток'
+            ],
+            FEVER_ALREADY_FINISHED: [
+                409,
+                'Все прокрутки Лихорадки уже выполнены'
+            ],
+            INVALID_FEVER_ROUNDS: [
+                409,
+                'Некорректные данные прокруток Лихорадки'
+            ]
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Fever spin failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// Завершение Лихорадки и начисление общей награды
+app.post('/api/roulette/fever/complete', async (req, res) => {
+    const { playerId, sessionId } = req.body || {};
+
+    if (
+        typeof playerId !== 'string' ||
+        typeof sessionId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)
+    ) {
+        return res.status(400).json({
+            error: 'Invalid fever completion data'
+        });
+    }
+
+    let client;
+
+    try {
+        const canonicalId = await resolvePlayerId(playerId);
+
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        await client.query(`SET LOCAL lock_timeout = '5s'`);
+        await client.query(`SET LOCAL statement_timeout = '15s'`);
+
+        // Блокируем счёт игрока
+        const account = await client.query(
+            `SELECT balance
+             FROM roulette_accounts
+             WHERE player_id = $1
+             FOR UPDATE`,
+            [canonicalId]
+        );
+
+        if (!account.rowCount) {
+            throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Блокируем сессию Лихорадки
+        const sessionResult = await client.query(
+            `SELECT *
+             FROM roulette_fever_sessions
+             WHERE id = $1
+               AND player_id = $2
+             FOR UPDATE`,
+            [sessionId, canonicalId]
+        );
+
+        if (!sessionResult.rowCount) {
+            throw new Error('FEVER_SESSION_NOT_FOUND');
+        }
+
+        const session = sessionResult.rows[0];
+
+        // Повторное завершение не должно начислять награду второй раз
+        if (session.status === 'completed') {
+            if (session.completion_result) {
+                const savedResult =
+                    typeof session.completion_result === 'string'
+                        ? JSON.parse(session.completion_result)
+                        : session.completion_result;
+
+                await client.query('COMMIT');
+
+                return res.json({
+                    ...savedResult,
+                    alreadyCompleted: true
+                });
+            }
+
+            throw new Error('FEVER_SESSION_NOT_PENDING');
+        }
+
+        if (session.status !== 'pending') {
+            throw new Error('FEVER_SESSION_NOT_PENDING');
+        }
+
+        // Проверяем срок действия
+        if (new Date(session.expires_at).getTime() <= Date.now()) {
+            await client.query(
+                `UPDATE roulette_fever_sessions
+                 SET status = 'expired'
+                 WHERE id = $1`,
+                [sessionId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(409).json({
+                error: 'Время Лихорадки истекло'
+            });
+        }
+
+        // Получаем три сохранённые прокрутки
+        const rounds = Array.isArray(session.rounds)
+            ? session.rounds
+            : JSON.parse(session.rounds);
+
+        if (
+            Number(session.current_round) !== 3 ||
+            !Array.isArray(rounds) ||
+            rounds.length !== 3
+        ) {
+            throw new Error('FEVER_NOT_FINISHED');
+        }
+
+        // Проверяем целостность каждой прокрутки
+        const allReels = [];
+        const completedRounds = [];
+
+        for (let i = 0; i < 3; i++) {
+            const round = rounds[i];
+
+            if (
+                !round ||
+                round.round !== i + 1 ||
+                !Array.isArray(round.reels) ||
+                round.reels.length !== 3 ||
+                round.reels.some(item =>
+                    !item ||
+                    typeof item.id !== 'string' ||
+                    !Number.isFinite(Number(item.points)) ||
+                    Number(item.points) < 0
+                )
+            ) {
+                throw new Error('INVALID_FEVER_ROUNDS');
+            }
+
+            const reels = round.reels;
+
+            // Пересчитываем значения на сервере
+            const score = getRouletteScore(reels);
+            const multiplier = getRouletteMultiplier(reels);
+            const jackpot = getRouletteJackpot(reels);
+
+            if (!Number.isFinite(score) || score < 0) {
+                throw new Error('INVALID_FEVER_ROUNDS');
+            }
+
+            allReels.push(...reels);
+
+            completedRounds.push({
+                round: i + 1,
+                reels,
+                score,
+                multiplier,
+                jackpot
+            });
+        }
+
+        // Проверяем все девять символов
+        const allEmpty =
+            allReels.length === 9 &&
+            allReels.every(item => item.id === 'empty');
+
+        // Если все девять символов пустые — награда сгорает
+        const totalScore = completedRounds.reduce(
+            (sum, round) => sum + round.score,
+            0
+        );
+
+        const reward = allEmpty
+            ? 0
+            : Math.round((totalScore + Number.EPSILON) * 100) / 100;
+
+        const currentBalance = Number(account.rows[0].balance);
+        const newBalance = Math.round(
+            (currentBalance + reward + Number.EPSILON) * 100
+        ) / 100;
+
+        // Начисляем общую награду
+        await client.query(
+            `UPDATE roulette_accounts
+             SET balance = $2,
+                 updated_at = NOW()
+             WHERE player_id = $1`,
+            [canonicalId, newBalance]
+        );
+
+        // Записываем одну общую финансовую операцию
+        await client.query(
+            `INSERT INTO roulette_transactions
+                (player_id, type, amount, details)
+             VALUES ($1, 'fever_reward', $2, $3::jsonb)`,
+            [
+                canonicalId,
+                reward,
+                JSON.stringify({
+                    sessionId,
+                    rounds: completedRounds,
+                    totalScore,
+                    allEmpty,
+                    reason: allEmpty
+                        ? 'all_nine_symbols_empty'
+                        : null
+                })
+            ]
+        );
+
+        // Сохраняем каждую из трёх прокруток в истории
+        for (const round of completedRounds) {
+            await client.query(
+                `INSERT INTO roulette_spins
+                    (player_id, nickname, mode, round_number,
+                     score, jackpot, reels)
+                 VALUES ($1, $2, 'fever', $3, $4, $5, $6::jsonb)`,
+                [
+                    canonicalId,
+                    session.nickname,
+                    round.round,
+                    round.score,
+                    round.jackpot,
+                    JSON.stringify(round.reels)
+                ]
+            );
+        }
+
+        const completionResult = {
+            success: true,
+            mode: 'fever',
+            sessionId,
+            rounds: completedRounds,
+            totalScore,
+            reward,
+            allEmpty,
+            balance: newBalance
+        };
+
+        // Закрываем сессию и сохраняем готовый ответ
+        await client.query(
+            `UPDATE roulette_fever_sessions
+             SET status = 'completed',
+                 completed_at = NOW(),
+                 completion_result = $2::jsonb
+             WHERE id = $1`,
+            [sessionId, JSON.stringify(completionResult)]
+        );
+
+        await client.query('COMMIT');
+
+        return res.json(completionResult);
+
+    } catch (error) {
+        if (client) {
+            await client.query('ROLLBACK').catch(() => {});
+        }
+
+        const errors = {
+            PLAYER_NOT_FOUND: [
+                404,
+                'Игрок не найден'
+            ],
+            FEVER_SESSION_NOT_FOUND: [
+                404,
+                'Сессия Лихорадки не найдена'
+            ],
+            FEVER_SESSION_NOT_PENDING: [
+                409,
+                'Лихорадка уже завершена'
+            ],
+            FEVER_NOT_FINISHED: [
+                409,
+                'Сначала выполните все три прокрутки'
+            ],
+            INVALID_FEVER_ROUNDS: [
+                409,
+                'Некорректные результаты Лихорадки'
+            ]
+        };
+
+        const [status, message] = errors[error.message] || [
+            503,
+            'Database temporarily unavailable'
+        ];
+
+        console.error('Fever completion failed:', error);
+
+        return res.status(status).json({
+            error: message
+        });
+
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
 app.post('/api/roulette/solo', async (req, res) => {
     cleanup();
 
@@ -2713,6 +3475,31 @@ app.post('/api/roulette/solo', async (req, res) => {
 
         if (!account.rowCount) {
             throw new Error('PLAYER_NOT_FOUND');
+        }
+
+        // Закрываем просроченные сессии Лихорадки
+        await client.query(
+            `UPDATE roulette_fever_sessions
+             SET status = 'expired'
+             WHERE player_id = $1
+               AND status = 'pending'
+               AND expires_at <= NOW()`,
+            [canonicalId]
+        );
+        
+        // Проверяем, не идёт ли сейчас действующая Лихорадка
+        const pendingFever = await client.query(
+            `SELECT id
+             FROM roulette_fever_sessions
+             WHERE player_id = $1
+               AND status = 'pending'
+               AND expires_at > NOW()
+             FOR UPDATE`,
+            [canonicalId]
+        );
+        
+        if (pendingFever.rowCount) {
+            throw new Error('FEVER_SESSION_ACTIVE');
         }
 
         // Ищем незавершённое вращение
@@ -2891,11 +3678,14 @@ app.post('/api/roulette/solo', async (req, res) => {
         console.error('Solo roulette failed:', error);
 
         return res.status(
-            error.message === 'PLAYER_NOT_FOUND' ? 404 : 503
+            error.message === 'PLAYER_NOT_FOUND' ? 404 :
+            error.message === 'FEVER_SESSION_ACTIVE' ? 409 : 503
         ).json({
             error: error.message === 'PLAYER_NOT_FOUND'
                 ? 'Player not found'
-                : 'Database temporarily unavailable'
+                : error.message === 'FEVER_SESSION_ACTIVE'
+                    ? 'Сначала завершите Лихорадку'
+                    : 'Database temporarily unavailable'
         });
 
     } finally {
@@ -3207,6 +3997,7 @@ app.post('/api/roulette/solo/reroll', async (req, res) => {
             REROLL_ALREADY_USED: [409, 'Переброс уже использован'],
             REROLL_NOT_UNLOCKED: [403, 'Механика переброса не разблокирована'],
             REROLL_ITEM_NOT_EQUIPPED: [403, 'Экипируйте модификатор «Переброс»'],
+            FEVER_SESSION_ACTIVE: [409, 'Сначала завершите Лихорадку'],
             INVALID_SESSION_REELS: [409, 'Некорректный результат вращения']
         };
 
@@ -4568,7 +5359,7 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
                     tr.player_id,
                     SUM(
                         CASE
-                            WHEN tr.type = 'solo_reward'
+                            WHEN tr.type IN ('solo_reward', 'fever_reward')
                                 THEN tr.amount
             
                             WHEN tr.type = 'match_payout'
@@ -4632,7 +5423,7 @@ app.get('/api/roulette/leaderboard/:playerId', async (req, res) => {
                     tr.player_id,
                     SUM(
                         CASE
-                            WHEN tr.type = 'solo_reward'
+                            WHEN tr.type IN ('solo_reward', 'fever_reward')
                                 THEN tr.amount
             
                             WHEN tr.type = 'match_payout'
@@ -6548,17 +7339,25 @@ async function initializeDatabase() {
         );
 
         CREATE TABLE IF NOT EXISTS roulette_spins (
-        id BIGSERIAL PRIMARY KEY,
-        player_id TEXT NOT NULL REFERENCES roulette_accounts(player_id),
-        nickname TEXT NOT NULL,
-        mode TEXT NOT NULL CHECK (mode IN ('solo', 'coop')),
-        match_id UUID REFERENCES roulette_matches(id),
-        round_number INTEGER,
-        score NUMERIC(14,2) NOT NULL,
-        jackpot BOOLEAN NOT NULL DEFAULT FALSE,
-        reels JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id BIGSERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL REFERENCES roulette_accounts(player_id),
+            nickname TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK (mode IN ('solo', 'coop')),
+            match_id UUID REFERENCES roulette_matches(id),
+            round_number INTEGER,
+            score NUMERIC(14,2) NOT NULL,
+            jackpot BOOLEAN NOT NULL DEFAULT FALSE,
+            reels JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        -- Разрешаем отдельный режим Лихорадки в истории вращений
+        ALTER TABLE roulette_spins
+        DROP CONSTRAINT IF EXISTS roulette_spins_mode_check;
+        
+        ALTER TABLE roulette_spins
+        ADD CONSTRAINT roulette_spins_mode_check
+        CHECK (mode IN ('solo', 'coop', 'fever'));
 
         -- Незавершённые соло-вращения
         CREATE TABLE IF NOT EXISTS roulette_solo_sessions (
@@ -6581,6 +7380,41 @@ async function initializeDatabase() {
             completed_at TIMESTAMPTZ,
             completion_result JSONB
             );
+
+            -- Активные и завершённые сессии «Лихорадки»
+            CREATE TABLE IF NOT EXISTS roulette_fever_sessions (
+                id UUID PRIMARY KEY,
+                player_id TEXT NOT NULL
+                    REFERENCES roulette_accounts(player_id)
+                    ON DELETE CASCADE,
+            
+                nickname TEXT NOT NULL,
+            
+                -- Количество завершённых прокруток: от 0 до 3
+                current_round INTEGER NOT NULL DEFAULT 0
+                    CHECK (current_round BETWEEN 0 AND 3),
+            
+                -- Результаты трёх прокруток по три символа
+                rounds JSONB NOT NULL DEFAULT '[]'::jsonb,
+            
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'completed', 'expired')),
+            
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+            
+                completion_result JSONB
+            );
+            
+            -- У одного игрока может быть только одна активная Лихорадка
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_fever_one_pending
+                ON roulette_fever_sessions (player_id)
+                WHERE status = 'pending';
+            
+            -- Быстрый поиск сессий игрока
+            CREATE INDEX IF NOT EXISTS idx_roulette_fever_player_status
+                ON roulette_fever_sessions (player_id, status);
 
         -- Не допускаем несколько незавершённых вращений одного игрока
         CREATE UNIQUE INDEX IF NOT EXISTS idx_roulette_solo_one_pending
