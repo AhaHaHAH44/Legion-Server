@@ -2677,6 +2677,23 @@ app.get('/api/roulette/status/:playerId', async (req, res) => {
     }
 });
 
+// Процент бонуса за золото в режиме «Лихорадка»
+function getFeverGoldBonusPercent(goldCount) {
+    const bonuses = {
+        1: 10,
+        2: 20,
+        3: 30,
+        4: 40,
+        5: 50,
+        6: 70,
+        7: 90,
+        8: 110,
+        9: 200
+    };
+
+    return bonuses[goldCount] || 0;
+}
+
 // Запуск отдельной сессии «Лихорадки»
 app.post('/api/roulette/fever/start', async (req, res) => {
     const { playerId } = req.body || {};
@@ -3059,7 +3076,13 @@ app.post('/api/roulette/fever/spin', async (req, res) => {
         // Рассчитываем результат этой прокрутки
         const score = getRouletteScore(reels);
         const multiplier = getRouletteMultiplier(reels);
-        const jackpot = getRouletteJackpot(reels);
+        
+        const isGoldenTriple =
+            reels.length === 3 &&
+            reels.every(item => item.id === 'gold');
+        
+        const jackpot =
+            getRouletteJackpot(reels) && !isGoldenTriple;
 
         const savedRound = {
             round: roundNumber,
@@ -3284,7 +3307,13 @@ app.post('/api/roulette/fever/complete', async (req, res) => {
             // Пересчитываем значения на сервере
             const score = getRouletteScore(reels);
             const multiplier = getRouletteMultiplier(reels);
-            const jackpot = getRouletteJackpot(reels);
+            
+            const isGoldenTriple =
+                reels.length === 3 &&
+                reels.every(item => item.id === 'gold');
+            
+            const jackpot =
+                getRouletteJackpot(reels) && !isGoldenTriple;
 
             if (!Number.isFinite(score) || score < 0) {
                 throw new Error('INVALID_FEVER_ROUNDS');
@@ -3306,15 +3335,32 @@ app.post('/api/roulette/fever/complete', async (req, res) => {
             allReels.length === 9 &&
             allReels.every(item => item.id === 'empty');
 
-        // Если все девять символов пустые — награда сгорает
+        // Подсчитываем золото среди всех девяти символов
+        const goldCount = allReels.filter(
+            item => item.id === 'gold'
+        ).length;
+        
+        // Получаем процент бонуса
+        const goldBonusPercent =
+            getFeverGoldBonusPercent(goldCount);
+
+        // Суммируем очки всех трёх прокруток
         const totalScore = completedRounds.reduce(
             (sum, round) => sum + round.score,
             0
         );
-
+        
+        // Рассчитываем дополнительную награду за золото
+        const goldBonusAmount = Math.round(
+            (totalScore * goldBonusPercent / 100 + Number.EPSILON) * 100
+        ) / 100;
+        
+        // Если все девять символов пустые — награда сгорает
         const reward = allEmpty
             ? 0
-            : Math.round((totalScore + Number.EPSILON) * 100) / 100;
+            : Math.round(
+                (totalScore + goldBonusAmount + Number.EPSILON) * 100
+            ) / 100;
 
         const currentBalance = Number(account.rows[0].balance);
         const newBalance = Math.round(
@@ -3342,6 +3388,9 @@ app.post('/api/roulette/fever/complete', async (req, res) => {
                     sessionId,
                     rounds: completedRounds,
                     totalScore,
+                    goldCount,
+                    goldBonusPercent,
+                    goldBonusAmount,
                     allEmpty,
                     reason: allEmpty
                         ? 'all_nine_symbols_empty'
@@ -3374,6 +3423,9 @@ app.post('/api/roulette/fever/complete', async (req, res) => {
             sessionId,
             rounds: completedRounds,
             totalScore,
+            goldCount,
+            goldBonusPercent,
+            goldBonusAmount,
             reward,
             allEmpty,
             balance: newBalance
